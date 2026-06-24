@@ -1,26 +1,27 @@
 """
 Scribd Downloader Web Server
-Full-featured web interface with download, history, queue, and stats.
+Full-featured web interface with download, history, queue, stats, and account management.
 """
 
 import asyncio
 import os
 import time
+import json
 import logging
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from downloader import download_scribd_document, extract_doc_id, extract_doc_title
 import database as db
+import account_manager as acct_mgr
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Scribd Downloader", version="2.0.0")
+app = FastAPI(title="Scribd Downloader", version="3.0.0")
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/tmp/scribd_downloads")
 COOKIES_PATH = os.environ.get("COOKIES_PATH", "")
@@ -37,6 +38,19 @@ class DownloadRequest(BaseModel):
     url: str
 
 
+class AddAccountRequest(BaseModel):
+    email: str
+    password: str = ""
+    label: str = ""
+    cookies_json: str = ""  # Optional: paste cookies JSON directly
+
+
+class UpdateAccountRequest(BaseModel):
+    status: str = ""       # active/disabled
+    label: str = ""
+    cookies_json: str = ""
+
+
 # ═══════════════════════════════════════════
 # API Endpoints
 # ═══════════════════════════════════════════
@@ -49,7 +63,8 @@ async def home():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "active": _active_count}
+    active_accounts = db.get_active_account_count()
+    return {"status": "ok", "active_downloads": _active_count, "active_accounts": active_accounts}
 
 
 @app.post("/api/download")
@@ -80,7 +95,6 @@ async def api_download(req: DownloadRequest, background_tasks: BackgroundTasks):
     global _active_count
     async with _active_lock:
         if _active_count >= MAX_CONCURRENT:
-            # Add to queue
             queue_id = db.add_to_queue(doc_id, req.url, source="web")
             return {
                 "status": "queued",
@@ -89,9 +103,11 @@ async def api_download(req: DownloadRequest, background_tasks: BackgroundTasks):
                 "message": f"Đã thêm vào hàng đợi (vị trí #{db.get_queue_status()['waiting']})"
             }
 
-    # Start download
-    record_id = db.add_download(doc_id, req.url, source="web")
-    background_tasks.add_task(_do_download, doc_id, req.url, record_id)
+    # Get account cookies (round-robin)
+    cookies, account_id = acct_mgr.get_cookies_for_download()
+
+    record_id = db.add_download(doc_id, req.url, source="web", account_id=account_id)
+    background_tasks.add_task(_do_download, doc_id, req.url, record_id, cookies, account_id)
     return {"status": "started", "doc_id": doc_id, "record_id": record_id}
 
 
@@ -126,7 +142,6 @@ async def get_file(doc_id: str):
             media_type="application/pdf",
             filename=os.path.basename(cached["file_path"]),
         )
-    # Fallback: search in download dir
     for f in os.listdir(DOWNLOAD_DIR):
         if f.endswith(f"_{doc_id}.pdf"):
             return FileResponse(
@@ -140,7 +155,6 @@ async def get_file(doc_id: str):
 @app.get("/api/history")
 async def get_history(limit: int = 50, offset: int = 0,
                       status: str = None, source: str = None):
-    """Get download history."""
     items = db.get_download_history(limit=limit, offset=offset,
                                      status=status, source=source)
     total = db.get_total_downloads()
@@ -149,14 +163,12 @@ async def get_history(limit: int = 50, offset: int = 0,
 
 @app.get("/api/search")
 async def search(q: str, limit: int = 20):
-    """Search download history."""
     items = db.search_downloads(q, limit=limit)
     return {"items": items, "query": q}
 
 
 @app.get("/api/queue")
 async def get_queue():
-    """Get queue status and items."""
     status = db.get_queue_status()
     waiting = db.get_queue_items("waiting")
     processing = db.get_queue_items("processing")
@@ -165,37 +177,144 @@ async def get_queue():
 
 @app.get("/api/stats")
 async def get_stats():
-    """Get download statistics."""
     summary = db.get_stats_summary()
     daily = db.get_daily_stats(30)
     return {"summary": summary, "daily": daily}
 
 
-@app.delete("/api/history/{record_id}")
-async def delete_record(record_id: int):
-    """Delete a download record."""
-    db.update_download(record_id, status="deleted")
-    return {"ok": True}
+# ═══════════════════════════════════════════
+# Account API Endpoints
+# ═══════════════════════════════════════════
+
+@app.get("/api/accounts")
+async def get_accounts():
+    """Get all accounts summary."""
+    return acct_mgr.get_accounts_summary()
+
+
+@app.post("/api/accounts")
+async def add_account(req: AddAccountRequest):
+    """Add a new Scribd account."""
+    if not req.email:
+        raise HTTPException(400, "Email là bắt buộc")
+
+    # If cookies JSON provided directly, use that
+    if req.cookies_json:
+        try:
+            cookies = json.loads(req.cookies_json)
+            if not isinstance(cookies, list):
+                raise ValueError("Cookies phải là danh sách")
+            acct_id = acct_mgr.add_account_with_cookies(
+                email=req.email,
+                cookies=cookies,
+                password=req.password,
+                label=req.label
+            )
+            return {
+                "success": True,
+                "account_id": acct_id,
+                "message": f"Đã thêm {req.email} với {len(cookies)} cookies"
+            }
+        except json.JSONDecodeError:
+            raise HTTPException(400, "Cookies JSON không hợp lệ")
+
+    # Otherwise save with password (login can be done later)
+    if req.password:
+        # Try auto-login
+        result = await acct_mgr.add_account_with_login(
+            email=req.email,
+            password=req.password,
+            label=req.label
+        )
+        return result
+    else:
+        # Just save email
+        acct_id = db.add_account(email=req.email, label=req.label)
+        return {
+            "success": True,
+            "account_id": acct_id,
+            "message": f"Đã thêm {req.email} (chưa có cookies, cần login)"
+        }
+
+
+@app.put("/api/accounts/{account_id}")
+async def update_account(account_id: int, req: UpdateAccountRequest):
+    """Update an account."""
+    account = db.get_account(account_id)
+    if not account:
+        raise HTTPException(404, "Tài khoản không tìm thấy")
+
+    if req.status == "active":
+        db.enable_account(account_id)
+    elif req.status == "disabled":
+        db.disable_account(account_id)
+
+    if req.label:
+        db.update_account(account_id, label=req.label)
+
+    if req.cookies_json:
+        try:
+            cookies = json.loads(req.cookies_json)
+            db.update_account_cookies(account_id, cookies)
+        except json.JSONDecodeError:
+            raise HTTPException(400, "Cookies JSON không hợp lệ")
+
+    return {"success": True, "message": "Đã cập nhật tài khoản"}
+
+
+@app.delete("/api/accounts/{account_id}")
+async def remove_account(account_id: int):
+    """Delete an account."""
+    account = db.get_account(account_id)
+    if not account:
+        raise HTTPException(404, "Tài khoản không tìm thấy")
+    db.delete_account(account_id)
+    return {"success": True, "message": f"Đã xóa {account['email']}"}
+
+
+@app.post("/api/accounts/{account_id}/refresh")
+async def refresh_account(account_id: int):
+    """Re-login and refresh cookies for an account."""
+    result = await acct_mgr.refresh_account_cookies(account_id)
+    return result
+
+
+@app.post("/api/accounts/{account_id}/toggle")
+async def toggle_account(account_id: int):
+    """Toggle account active/disabled."""
+    account = db.get_account(account_id)
+    if not account:
+        raise HTTPException(404, "Tài khoản không tìm thấy")
+
+    if account["status"] == "active":
+        db.disable_account(account_id)
+        return {"success": True, "new_status": "disabled"}
+    else:
+        db.enable_account(account_id)
+        return {"success": True, "new_status": "active"}
 
 
 # ═══════════════════════════════════════════
 # Background Download Worker
 # ═══════════════════════════════════════════
 
-async def _do_download(doc_id: str, url: str, record_id: int):
-    """Background download task."""
+async def _do_download(doc_id: str, url: str, record_id: int,
+                       cookies: list = None, account_id: int = 0):
+    """Background download task with account rotation."""
     global _active_count
     async with _active_lock:
         _active_count += 1
 
     start_time = time.time()
     try:
-        cookies_path = COOKIES_PATH if COOKIES_PATH and os.path.exists(COOKIES_PATH) else None
-        result = await download_scribd_document(
-            url=url,
-            output_dir=DOWNLOAD_DIR,
-            cookies_json=cookies_path,
-        )
+        # Build download kwargs
+        dl_kwargs = {"url": url, "output_dir": DOWNLOAD_DIR}
+        if cookies:
+            dl_kwargs["cookies_list"] = cookies
+        elif COOKIES_PATH and os.path.exists(COOKIES_PATH):
+            dl_kwargs["cookies_json"] = COOKIES_PATH
+
+        result = await download_scribd_document(**dl_kwargs)
         duration = time.time() - start_time
 
         if result["success"]:
@@ -208,7 +327,8 @@ async def _do_download(doc_id: str, url: str, record_id: int):
                 file_path=result["pdf_path"],
                 duration=duration,
             )
-            logger.info(f"✅ Downloaded {doc_id}: {result['title']} ({result['pages']}p, {duration:.1f}s)")
+            logger.info(f"✅ Downloaded {doc_id}: {result['title']} "
+                        f"({result['pages']}p, {duration:.1f}s, acct#{account_id})")
         else:
             db.mark_download_failed(record_id, result["error"], duration)
             logger.error(f"❌ Failed {doc_id}: {result['error']}")
@@ -219,7 +339,6 @@ async def _do_download(doc_id: str, url: str, record_id: int):
     finally:
         async with _active_lock:
             _active_count -= 1
-        # Process queue
         await _process_queue()
 
 
@@ -232,12 +351,14 @@ async def _process_queue():
 
     item = db.get_next_in_queue()
     if item:
+        cookies, account_id = acct_mgr.get_cookies_for_download()
         record_id = db.add_download(
             item["doc_id"], item["url"],
-            source=item["source"], user_id=item["user_id"]
+            source=item["source"], user_id=item["user_id"],
+            account_id=account_id
         )
         db.complete_queue_item(item["id"], "completed")
-        await _do_download(item["doc_id"], item["url"], record_id)
+        await _do_download(item["doc_id"], item["url"], record_id, cookies, account_id)
 
 
 # ═══════════════════════════════════════════
@@ -264,12 +385,10 @@ def get_html() -> str:
             background: var(--bg); color: var(--text);
             min-height: 100vh;
         }
-        .container { max-width: 900px; margin: 0 auto; padding: 20px; }
+        .container { max-width: 960px; margin: 0 auto; padding: 20px; }
 
         /* Header */
-        .header {
-            text-align: center; padding: 40px 0 30px;
-        }
+        .header { text-align: center; padding: 40px 0 30px; }
         .header h1 {
             font-size: 2rem; font-weight: 700;
             background: linear-gradient(135deg, var(--accent), var(--accent2));
@@ -282,9 +401,7 @@ def get_html() -> str:
             background: var(--surface); border: 1px solid var(--border);
             border-radius: 16px; padding: 28px; margin-bottom: 24px;
         }
-        .input-row {
-            display: flex; gap: 12px;
-        }
+        .input-row { display: flex; gap: 12px; }
         .input-row input {
             flex: 1; padding: 14px 18px; border-radius: 10px;
             border: 1px solid var(--border); background: var(--surface2);
@@ -302,6 +419,18 @@ def get_html() -> str:
         }
         .btn-primary:hover { transform: translateY(-1px); opacity: 0.9; }
         .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+        .btn-sm {
+            padding: 6px 14px; border-radius: 6px; border: none;
+            font-size: 0.8rem; font-weight: 500; cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        .btn-sm:hover { opacity: 0.8; }
+        .btn-success { background: var(--success); color: #fff; }
+        .btn-danger { background: var(--danger); color: #fff; }
+        .btn-warning { background: var(--warning); color: #222; }
+        .btn-ghost {
+            background: var(--surface2); color: var(--text2); border: 1px solid var(--border);
+        }
 
         /* Status */
         .status-area {
@@ -359,11 +488,14 @@ def get_html() -> str:
         .badge-failed { background: rgba(255,107,107,0.15); color: var(--danger); }
         .badge-downloading { background: rgba(108,92,231,0.15); color: var(--accent2); }
         .badge-queued, .badge-waiting { background: rgba(254,202,87,0.15); color: var(--warning); }
+        .badge-active { background: rgba(0,184,148,0.15); color: var(--success); }
+        .badge-disabled { background: rgba(139,143,163,0.15); color: var(--text2); }
+        .badge-error { background: rgba(255,107,107,0.15); color: var(--danger); }
         .badge-web { background: rgba(108,92,231,0.15); color: var(--accent2); }
         .badge-telegram { background: rgba(0,184,148,0.15); color: var(--success); }
 
         .title-cell {
-            max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
         .dl-link {
             color: var(--accent2); text-decoration: none; font-weight: 500;
@@ -372,7 +504,7 @@ def get_html() -> str:
 
         /* Stats */
         .stats-grid {
-            display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
             gap: 12px; margin-bottom: 20px;
         }
         .stat-card {
@@ -399,12 +531,36 @@ def get_html() -> str:
         }
         .empty-state .icon { font-size: 2.5rem; margin-bottom: 8px; }
 
+        /* Account Form */
+        .add-account-form {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 16px; padding: 20px; margin-bottom: 16px;
+        }
+        .form-row { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+        .form-row input, .form-row textarea {
+            flex: 1; min-width: 160px; padding: 10px 14px; border-radius: 8px;
+            border: 1px solid var(--border); background: var(--surface2);
+            color: var(--text); font-size: 0.9rem; outline: none;
+        }
+        .form-row input:focus, .form-row textarea:focus { border-color: var(--accent); }
+        .form-row textarea { min-height: 60px; resize: vertical; font-family: monospace; font-size: 0.8rem; }
+
+        .account-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+        .email-cell { font-family: monospace; font-size: 0.85rem; }
+        .cookie-indicator {
+            display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+            margin-right: 6px;
+        }
+        .cookie-yes { background: var(--success); }
+        .cookie-no { background: var(--danger); }
+
         /* Responsive */
         @media (max-width: 640px) {
             .input-row { flex-direction: column; }
             .stats-grid { grid-template-columns: repeat(2, 1fr); }
             .header h1 { font-size: 1.5rem; }
             th, td { padding: 10px 12px; font-size: 0.8rem; }
+            .form-row { flex-direction: column; }
         }
     </style>
 </head>
@@ -428,29 +584,51 @@ def get_html() -> str:
         <div class="tabs">
             <button class="tab active" data-tab="history" onclick="switchTab('history')">📋 Lịch sử</button>
             <button class="tab" data-tab="queue" onclick="switchTab('queue')">🔄 Hàng đợi</button>
+            <button class="tab" data-tab="accounts" onclick="switchTab('accounts')">👤 Tài khoản</button>
             <button class="tab" data-tab="stats" onclick="switchTab('stats')">📊 Thống kê</button>
         </div>
 
+        <!-- History Tab -->
         <div id="tab-history">
             <input type="text" class="search-bar" id="searchInput"
                    placeholder="🔍 Tìm theo tên tài liệu..." oninput="debounceSearch()">
             <div class="panel" id="historyPanel">
-                <div class="empty-state">
-                    <div class="icon">📭</div>
-                    <p>Chưa có lịch sử tải</p>
-                </div>
+                <div class="empty-state"><div class="icon">📭</div><p>Chưa có lịch sử tải</p></div>
             </div>
         </div>
 
+        <!-- Queue Tab -->
         <div id="tab-queue" style="display:none">
             <div class="panel" id="queuePanel">
-                <div class="empty-state">
-                    <div class="icon">✅</div>
-                    <p>Hàng đợi trống</p>
-                </div>
+                <div class="empty-state"><div class="icon">✅</div><p>Hàng đợi trống</p></div>
             </div>
         </div>
 
+        <!-- Accounts Tab -->
+        <div id="tab-accounts" style="display:none">
+            <div class="add-account-form">
+                <h3 style="margin-bottom:12px;font-size:1rem;">➕ Thêm tài khoản Scribd</h3>
+                <div class="form-row">
+                    <input type="email" id="acctEmail" placeholder="Email Scribd">
+                    <input type="password" id="acctPassword" placeholder="Mật khẩu (tuỳ chọn)">
+                    <input type="text" id="acctLabel" placeholder="Nhãn (tuỳ chọn)">
+                </div>
+                <div class="form-row">
+                    <textarea id="acctCookies" placeholder='Paste cookies JSON (tuỳ chọn) — [{&quot;name&quot;:&quot;...&quot;, &quot;value&quot;:&quot;...&quot;, &quot;domain&quot;:&quot;.scribd.com&quot;}]'></textarea>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <button class="btn-primary" style="padding:10px 20px;font-size:0.9rem;" onclick="addAccount()">
+                        ➕ Thêm tài khoản
+                    </button>
+                    <span id="acctAddStatus" style="color:var(--text2);font-size:0.85rem;"></span>
+                </div>
+            </div>
+            <div class="panel" id="accountsPanel">
+                <div class="empty-state"><div class="icon">👤</div><p>Chưa có tài khoản nào</p></div>
+            </div>
+        </div>
+
+        <!-- Stats Tab -->
         <div id="tab-stats" style="display:none">
             <div class="stats-grid" id="statsGrid"></div>
         </div>
@@ -469,12 +647,10 @@ def get_html() -> str:
                 showStatus('error', '❌ Vui lòng nhập link Scribd hợp lệ');
                 return;
             }
-
             const btn = document.getElementById('downloadBtn');
             btn.disabled = true;
             btn.textContent = '⏳ Đang xử lý...';
             showStatus('downloading', '<span class="spinner"></span> Đang bắt đầu tải...');
-
             try {
                 const res = await fetch('/api/download', {
                     method: 'POST',
@@ -482,31 +658,23 @@ def get_html() -> str:
                     body: JSON.stringify({url})
                 });
                 const data = await res.json();
-
                 if (data.status === 'cached') {
-                    showStatus('cached', `✅ <b>${data.title}</b> (${data.pages} trang) — đã có sẵn!
-                        <br><a class="dl-link" href="${data.download_url}" target="_blank">⬇️ Tải PDF</a>`);
-                    btn.disabled = false;
-                    btn.textContent = '⬇️ Tải PDF';
+                    showStatus('cached', `✅ <b>${data.title}</b> (${data.pages} trang) — đã có sẵn!<br><a class="dl-link" href="${data.download_url}" target="_blank">⬇️ Tải PDF</a>`);
+                    btn.disabled = false; btn.textContent = '⬇️ Tải PDF';
                     loadHistory();
                 } else if (data.status === 'queued') {
                     showStatus('downloading', `🔄 ${data.message}`);
                     startPolling(data.doc_id);
-                } else if (data.status === 'started') {
-                    showStatus('downloading', '<span class="spinner"></span> Đang tải tài liệu... (có thể mất 30s-2 phút)');
-                    startPolling(data.doc_id);
-                } else if (data.status === 'downloading') {
-                    showStatus('downloading', '<span class="spinner"></span> Đang tải...');
+                } else if (data.status === 'started' || data.status === 'downloading') {
+                    showStatus('downloading', '<span class="spinner"></span> Đang tải tài liệu... (30s-2 phút)');
                     startPolling(data.doc_id);
                 } else {
-                    showStatus('error', `❌ ${data.detail || data.message || 'Lỗi không xác định'}`);
-                    btn.disabled = false;
-                    btn.textContent = '⬇️ Tải PDF';
+                    showStatus('error', `❌ ${data.detail || data.message || 'Lỗi'}`);
+                    btn.disabled = false; btn.textContent = '⬇️ Tải PDF';
                 }
             } catch (e) {
                 showStatus('error', `❌ Lỗi kết nối: ${e.message}`);
-                btn.disabled = false;
-                btn.textContent = '⬇️ Tải PDF';
+                btn.disabled = false; btn.textContent = '⬇️ Tải PDF';
             }
         }
 
@@ -517,16 +685,13 @@ def get_html() -> str:
                     const res = await fetch(`/api/status/${docId}`);
                     const data = await res.json();
                     if (data.status === 'completed') {
-                        clearInterval(pollInterval);
-                        pollInterval = null;
-                        showStatus('success', `✅ <b>${data.title}</b> — ${data.pages} trang (${(data.file_size/1024/1024).toFixed(1)}MB, ${data.duration.toFixed(0)}s)
-                            <br><a class="dl-link" href="${data.download_url}" target="_blank">⬇️ Tải PDF ngay</a>`);
+                        clearInterval(pollInterval); pollInterval = null;
+                        showStatus('success', `✅ <b>${data.title}</b> — ${data.pages} trang (${(data.file_size/1024/1024).toFixed(1)}MB, ${data.duration.toFixed(0)}s)<br><a class="dl-link" href="${data.download_url}" target="_blank">⬇️ Tải PDF ngay</a>`);
                         document.getElementById('downloadBtn').disabled = false;
                         document.getElementById('downloadBtn').textContent = '⬇️ Tải PDF';
                         loadHistory();
                     } else if (data.status === 'failed') {
-                        clearInterval(pollInterval);
-                        pollInterval = null;
+                        clearInterval(pollInterval); pollInterval = null;
                         showStatus('error', `❌ ${data.error || 'Tải thất bại'}`);
                         document.getElementById('downloadBtn').disabled = false;
                         document.getElementById('downloadBtn').textContent = '⬇️ Tải PDF';
@@ -566,17 +731,8 @@ def get_html() -> str:
                 const time = new Date(item.created_at + 'Z').toLocaleString('vi-VN', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
                 const badge = `<span class="badge badge-${item.status}">${item.status}</span>`;
                 const srcBadge = `<span class="badge badge-${item.source}">${item.source}</span>`;
-                const dl = item.status === 'completed'
-                    ? `<a class="dl-link" href="/api/file/${item.doc_id}" target="_blank">⬇️</a>`
-                    : '';
-                html += `<tr>
-                    <td class="title-cell" title="${title}">${title}</td>
-                    <td>${item.pages || '-'}</td>
-                    <td>${srcBadge}</td>
-                    <td>${badge}</td>
-                    <td style="color:var(--text2)">${time}</td>
-                    <td>${dl}</td>
-                </tr>`;
+                const dl = item.status === 'completed' ? `<a class="dl-link" href="/api/file/${item.doc_id}" target="_blank">⬇️</a>` : '';
+                html += `<tr><td class="title-cell" title="${title}">${title}</td><td>${item.pages||'-'}</td><td>${srcBadge}</td><td>${badge}</td><td style="color:var(--text2)">${time}</td><td>${dl}</td></tr>`;
             }
             html += '</tbody></table>';
             panel.innerHTML = html;
@@ -605,17 +761,122 @@ def get_html() -> str:
                 const panel = document.getElementById('queuePanel');
                 const all = [...data.processing, ...data.waiting];
                 if (!all.length) {
-                    panel.innerHTML = '<div class="empty-state"><div class="icon">✅</div><p>Hàng đợi trống — tất cả đã xử lý</p></div>';
+                    panel.innerHTML = '<div class="empty-state"><div class="icon">✅</div><p>Hàng đợi trống</p></div>';
                     return;
                 }
                 let html = `<table><thead><tr><th>URL</th><th>Nguồn</th><th>Trạng thái</th><th>Thời gian</th></tr></thead><tbody>`;
                 for (const item of all) {
                     const time = new Date(item.created_at + 'Z').toLocaleString('vi-VN', {hour:'2-digit',minute:'2-digit'});
-                    const badge = `<span class="badge badge-${item.status}">${item.status}</span>`;
-                    html += `<tr><td class="title-cell">${item.url}</td><td>${item.source}</td><td>${badge}</td><td>${time}</td></tr>`;
+                    html += `<tr><td class="title-cell">${item.url}</td><td>${item.source}</td><td><span class="badge badge-${item.status}">${item.status}</span></td><td>${time}</td></tr>`;
                 }
                 html += '</tbody></table>';
                 panel.innerHTML = html;
+            } catch(e) {}
+        }
+
+        // ═══ Accounts ═══
+        async function loadAccounts() {
+            try {
+                const res = await fetch('/api/accounts');
+                const data = await res.json();
+                renderAccounts(data);
+            } catch(e) {}
+        }
+
+        function renderAccounts(data) {
+            const panel = document.getElementById('accountsPanel');
+            if (!data.accounts || !data.accounts.length) {
+                panel.innerHTML = '<div class="empty-state"><div class="icon">👤</div><p>Chưa có tài khoản nào. Thêm tài khoản Scribd ở trên để bắt đầu.</p></div>';
+                return;
+            }
+            let html = `<table><thead><tr>
+                <th>Email</th><th>Nhãn</th><th>Cookies</th>
+                <th>Đã tải</th><th>Trạng thái</th><th>Hành động</th>
+            </tr></thead><tbody>`;
+            for (const a of data.accounts) {
+                const cookieIcon = a.has_cookies
+                    ? '<span class="cookie-indicator cookie-yes"></span>Có'
+                    : '<span class="cookie-indicator cookie-no"></span>Chưa';
+                const badge = `<span class="badge badge-${a.status}">${a.status}</span>`;
+                const toggleText = a.status === 'active' ? 'Tắt' : 'Bật';
+                const toggleClass = a.status === 'active' ? 'btn-warning' : 'btn-success';
+                html += `<tr>
+                    <td class="email-cell">${a.email}</td>
+                    <td>${a.label || '-'}</td>
+                    <td>${cookieIcon}</td>
+                    <td>${a.download_count}</td>
+                    <td>${badge}${a.error ? '<br><small style="color:var(--danger)">'+a.error.substring(0,40)+'</small>' : ''}</td>
+                    <td>
+                        <div class="account-actions">
+                            <button class="btn-sm ${toggleClass}" onclick="toggleAccount(${a.id})">${toggleText}</button>
+                            <button class="btn-sm btn-ghost" onclick="refreshAccount(${a.id})">🔄</button>
+                            <button class="btn-sm btn-danger" onclick="deleteAccount(${a.id},'${a.email}')">🗑️</button>
+                        </div>
+                    </td>
+                </tr>`;
+            }
+            html += '</tbody></table>';
+            // Summary bar
+            html = `<div style="padding:12px 16px;background:var(--surface2);font-size:0.85rem;color:var(--text2);">
+                Tổng: ${data.total} · <span style="color:var(--success)">Active: ${data.active}</span> · Error: ${data.error} · Disabled: ${data.disabled} · Tổng tải: ${data.total_downloads}
+            </div>` + html;
+            panel.innerHTML = html;
+        }
+
+        async function addAccount() {
+            const email = document.getElementById('acctEmail').value.trim();
+            const password = document.getElementById('acctPassword').value;
+            const label = document.getElementById('acctLabel').value.trim();
+            const cookiesRaw = document.getElementById('acctCookies').value.trim();
+            const statusEl = document.getElementById('acctAddStatus');
+
+            if (!email) { statusEl.textContent = '⚠️ Cần nhập email'; return; }
+
+            statusEl.textContent = '⏳ Đang thêm...';
+            try {
+                const body = {email, password, label};
+                if (cookiesRaw) body.cookies_json = cookiesRaw;
+                const res = await fetch('/api/accounts', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+                statusEl.textContent = data.message || (data.success ? '✅ Thành công' : '❌ Thất bại');
+                if (data.success || data.account_id) {
+                    document.getElementById('acctEmail').value = '';
+                    document.getElementById('acctPassword').value = '';
+                    document.getElementById('acctLabel').value = '';
+                    document.getElementById('acctCookies').value = '';
+                    loadAccounts();
+                }
+                setTimeout(() => { statusEl.textContent = ''; }, 5000);
+            } catch(e) {
+                statusEl.textContent = `❌ ${e.message}`;
+            }
+        }
+
+        async function toggleAccount(id) {
+            try {
+                await fetch(`/api/accounts/${id}/toggle`, {method:'POST'});
+                loadAccounts();
+            } catch(e) {}
+        }
+
+        async function refreshAccount(id) {
+            try {
+                const res = await fetch(`/api/accounts/${id}/refresh`, {method:'POST'});
+                const data = await res.json();
+                alert(data.message || 'Done');
+                loadAccounts();
+            } catch(e) { alert('Lỗi: ' + e.message); }
+        }
+
+        async function deleteAccount(id, email) {
+            if (!confirm(`Xóa tài khoản ${email}?`)) return;
+            try {
+                await fetch(`/api/accounts/${id}`, {method:'DELETE'});
+                loadAccounts();
             } catch(e) {}
         }
 
@@ -625,15 +886,19 @@ def get_html() -> str:
                 const res = await fetch('/api/stats');
                 const data = await res.json();
                 const s = data.summary;
-                const grid = document.getElementById('statsGrid');
                 const mb = ((s.total_bytes || 0) / 1024 / 1024).toFixed(1);
-                grid.innerHTML = `
+                // Also get account info
+                const acctRes = await fetch('/api/accounts');
+                const acctData = await acctRes.json();
+                document.getElementById('statsGrid').innerHTML = `
                     <div class="stat-card"><div class="number">${s.total || 0}</div><div class="label">Tổng tải</div></div>
                     <div class="stat-card"><div class="number">${s.successful || 0}</div><div class="label">Thành công</div></div>
                     <div class="stat-card"><div class="number">${s.failed || 0}</div><div class="label">Thất bại</div></div>
                     <div class="stat-card"><div class="number">${s.total_pages || 0}</div><div class="label">Tổng trang</div></div>
                     <div class="stat-card"><div class="number">${mb}MB</div><div class="label">Dung lượng</div></div>
                     <div class="stat-card"><div class="number">${(s.avg_duration || 0).toFixed(0)}s</div><div class="label">TB thời gian</div></div>
+                    <div class="stat-card"><div class="number">${acctData.active || 0}</div><div class="label">TK Active</div></div>
+                    <div class="stat-card"><div class="number">${acctData.total || 0}</div><div class="label">Tổng TK</div></div>
                 `;
             } catch(e) {}
         }
@@ -642,11 +907,12 @@ def get_html() -> str:
         function switchTab(tab) {
             currentTab = tab;
             document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
-            document.getElementById('tab-history').style.display = tab === 'history' ? '' : 'none';
-            document.getElementById('tab-queue').style.display = tab === 'queue' ? '' : 'none';
-            document.getElementById('tab-stats').style.display = tab === 'stats' ? '' : 'none';
+            ['history','queue','accounts','stats'].forEach(t => {
+                document.getElementById('tab-' + t).style.display = t === tab ? '' : 'none';
+            });
             if (tab === 'history') loadHistory();
             if (tab === 'queue') loadQueue();
+            if (tab === 'accounts') loadAccounts();
             if (tab === 'stats') loadStats();
         }
 

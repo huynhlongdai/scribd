@@ -43,6 +43,7 @@ async def download_scribd_document(
     url: str,
     output_dir: str = "/tmp/scribd_downloads",
     cookies_json: str | None = None,
+    cookies_list: list | None = None,
     quality: int = 90,
     timeout: int = 120,
 ) -> dict:
@@ -53,6 +54,7 @@ async def download_scribd_document(
         url: Scribd document URL
         output_dir: Directory to save the PDF
         cookies_json: Optional path to cookies.json for authenticated downloads
+        cookies_list: Optional list of cookie dicts (takes priority over cookies_json)
         quality: Screenshot quality (1-100)
         timeout: Max seconds to wait for page load
     
@@ -89,14 +91,17 @@ async def download_scribd_document(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             
-            # Load cookies if provided
-            if cookies_json and os.path.exists(cookies_json):
+            # Load cookies: prefer cookies_list, fallback to cookies_json file
+            raw_cookies = cookies_list
+            if raw_cookies is None and cookies_json and os.path.exists(cookies_json):
                 import json
                 with open(cookies_json) as f:
-                    cookies = json.load(f)
+                    raw_cookies = json.load(f)
+            
+            if raw_cookies:
                 # Convert cookie format for Playwright
                 pw_cookies = []
-                for c in cookies:
+                for c in raw_cookies:
                     pw_cookie = {
                         "name": c["name"],
                         "value": c["value"],

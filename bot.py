@@ -31,6 +31,7 @@ from telegram.ext import (
 
 from downloader import download_scribd_document, extract_doc_id
 import database as db
+import account_manager as acct_mgr
 
 # Configuration
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -88,6 +89,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/history \\- Lịch sử tải\n"
         "/status \\- Trạng thái hàng đợi\n"
         "/stats \\- Thống kê\n"
+        "/accounts \\- Danh sách tài khoản\n"
+        "/addaccount \\- Thêm tài khoản Scribd\n"
+        "/removeaccount \\- Xóa tài khoản\n"
         "/help \\- Trợ giúp"
     )
     await update.message.reply_text(welcome, parse_mode="MarkdownV2")
@@ -164,6 +168,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = db.get_stats_summary()
     total_mb = (summary.get("total_bytes") or 0) / 1024 / 1024
     avg_dur = summary.get("avg_duration") or 0
+    acct_summary = acct_mgr.get_accounts_summary()
 
     text = (
         f"📊 *Thống kê chi tiết*\n\n"
@@ -172,9 +177,77 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"❌ Thất bại: {summary.get('failed', 0)}\n"
         f"📃 Tổng trang: {summary.get('total_pages', 0)}\n"
         f"💾 Dung lượng: {total_mb:.1f}MB\n"
-        f"⏱ TB thời gian: {avg_dur:.0f}s\n"
+        f"⏱ TB thời gian: {avg_dur:.0f}s\n\n"
+        f"👤 *Tài khoản Scribd:*\n"
+        f"   Active: {acct_summary['active']} / {acct_summary['total']}\n"
+        f"   Lỗi: {acct_summary['error']}"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show accounts list."""
+    summary = acct_mgr.get_accounts_summary()
+    if not summary["accounts"]:
+        await update.message.reply_text("👤 Chưa có tài khoản Scribd nào.")
+        return
+
+    lines = [f"👤 *Tài khoản Scribd ({summary['active']}/{summary['total']} active):*\n"]
+    for a in summary["accounts"]:
+        icon = "✅" if a["status"] == "active" else "❌" if a["status"] == "error" else "⏸"
+        cookies_icon = "🍪" if a["has_cookies"] else "🔒"
+        label = f" ({a['label']})" if a["label"] else ""
+        lines.append(f"{icon} `{a['email']}`{label} {cookies_icon} — {a['download_count']} lượt")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def addaccount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a Scribd account: /addaccount email password [label]"""
+    args = context.args or []
+    if len(args) < 1:
+        await update.message.reply_text(
+            "📝 *Cách dùng:*\n"
+            "`/addaccount email@example.com password nhãn`\n\n"
+            "Ví dụ: `/addaccount user@gmail.com MyPass123 TK-chính`",
+            parse_mode="Markdown"
+        )
+        return
+
+    email = args[0]
+    password = args[1] if len(args) > 1 else ""
+    label = " ".join(args[2:]) if len(args) > 2 else ""
+
+    msg = await update.message.reply_text(f"⏳ Đang thêm tài khoản {email}...")
+
+    # Save account (with or without login attempt)
+    if password:
+        result = await acct_mgr.add_account_with_login(email, password, label)
+        await msg.edit_text(
+            f"{'✅' if result['success'] else '⚠️'} {result['message']}"
+        )
+    else:
+        acct_id = db.add_account(email=email, label=label)
+        await msg.edit_text(
+            f"✅ Đã thêm {email} (chưa có mật khẩu/cookies, cần cập nhật qua Web UI)"
+        )
+
+
+async def removeaccount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a Scribd account: /removeaccount email"""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("📝 Cách dùng: `/removeaccount email@example.com`", parse_mode="Markdown")
+        return
+
+    email = args[0]
+    account = db.get_account_by_email(email)
+    if not account:
+        await update.message.reply_text(f"❌ Không tìm thấy tài khoản {email}")
+        return
+
+    db.delete_account(account["id"])
+    await update.message.reply_text(f"✅ Đã xóa tài khoản {email}")
 
 
 # ═══════════════════════════════════════════
@@ -251,17 +324,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     active_downloads[user_id] = url
+
+    # Get account cookies (round-robin rotation)
+    cookies, account_id = acct_mgr.get_cookies_for_download()
+
     record_id = db.add_download(doc_id, url, source="telegram",
-                                user_id=str(user_id), user_name=user_name)
+                                user_id=str(user_id), user_name=user_name,
+                                account_id=account_id)
     start_time = time.time()
 
     try:
-        cookies_path = COOKIES_PATH if COOKIES_PATH and os.path.exists(COOKIES_PATH) else None
-        result = await download_scribd_document(
-            url=url,
-            output_dir=DOWNLOAD_DIR,
-            cookies_json=cookies_path,
-        )
+        dl_kwargs = {"url": url, "output_dir": DOWNLOAD_DIR}
+        if cookies:
+            dl_kwargs["cookies_list"] = cookies
+        elif COOKIES_PATH and os.path.exists(COOKIES_PATH):
+            dl_kwargs["cookies_json"] = COOKIES_PATH
+
+        result = await download_scribd_document(**dl_kwargs)
         duration = time.time() - start_time
 
         if result["success"]:
@@ -324,6 +403,9 @@ def main():
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("accounts", accounts_command))
+    app.add_handler(CommandHandler("addaccount", addaccount_command))
+    app.add_handler(CommandHandler("removeaccount", removeaccount_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("🤖 Bot started!")

@@ -1,6 +1,6 @@
 """
 Database layer for Scribd Downloader
-Uses SQLite for download history, queue management, and stats.
+Uses SQLite for download history, queue management, stats, and account management.
 """
 
 import os
@@ -55,6 +55,7 @@ def init_db():
                 source TEXT DEFAULT 'telegram',
                 user_id TEXT DEFAULT '',
                 user_name TEXT DEFAULT '',
+                account_id INTEGER DEFAULT 0,
                 error_message TEXT DEFAULT '',
                 created_at TEXT DEFAULT (datetime('now')),
                 started_at TEXT,
@@ -85,12 +86,182 @@ def init_db():
                 UNIQUE(date)
             );
 
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE,
+                password TEXT DEFAULT '',
+                cookies_json TEXT DEFAULT '[]',
+                status TEXT DEFAULT 'active',
+                label TEXT DEFAULT '',
+                download_count INTEGER DEFAULT 0,
+                last_used_at TEXT,
+                last_login_at TEXT,
+                error_message TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_downloads_doc_id ON downloads(doc_id);
             CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status);
             CREATE INDEX IF NOT EXISTS idx_downloads_created ON downloads(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_downloads_user ON downloads(user_id);
             CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status);
+            CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
         """)
+
+
+# ═══════════════════════════════════════════
+# Account Management
+# ═══════════════════════════════════════════
+
+def add_account(email: str, password: str = "", cookies: list = None,
+                label: str = "") -> int:
+    """Add a new Scribd account. Returns account ID."""
+    cookies_str = json.dumps(cookies or [])
+    with get_db() as conn:
+        cursor = conn.execute(
+            """INSERT INTO accounts (email, password, cookies_json, label, status)
+               VALUES (?, ?, ?, ?, 'active')
+               ON CONFLICT(email) DO UPDATE SET
+                   password = excluded.password,
+                   cookies_json = excluded.cookies_json,
+                   label = CASE WHEN excluded.label != '' THEN excluded.label ELSE accounts.label END,
+                   status = 'active',
+                   updated_at = datetime('now')""",
+            (email, password, cookies_str, label)
+        )
+        return cursor.lastrowid
+
+
+def get_account(account_id: int) -> Optional[dict]:
+    """Get a single account by ID."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_all_accounts(include_disabled: bool = False) -> list[dict]:
+    """Get all accounts."""
+    with get_db() as conn:
+        if include_disabled:
+            rows = conn.execute(
+                "SELECT * FROM accounts ORDER BY created_at"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM accounts WHERE status = 'active' ORDER BY download_count ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_next_account() -> Optional[dict]:
+    """Get the next account to use (round-robin by least used, active only)."""
+    with get_db() as conn:
+        row = conn.execute(
+            """SELECT * FROM accounts
+               WHERE status = 'active'
+               ORDER BY
+                   CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END,
+                   last_used_at ASC,
+                   download_count ASC
+               LIMIT 1"""
+        ).fetchone()
+        if row:
+            d = dict(row)
+            # Mark as used
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """UPDATE accounts SET
+                       last_used_at = ?,
+                       download_count = download_count + 1,
+                       updated_at = ?
+                   WHERE id = ?""",
+                (now, now, d["id"])
+            )
+            return d
+    return None
+
+
+def update_account(account_id: int, **kwargs):
+    """Update account fields."""
+    allowed = {"email", "password", "cookies_json", "status", "label",
+               "error_message", "last_login_at", "last_used_at"}
+    fields = {k: v for k, v in kwargs.items() if k in allowed}
+    if not fields:
+        return
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [account_id]
+    with get_db() as conn:
+        conn.execute(f"UPDATE accounts SET {set_clause} WHERE id = ?", values)
+
+
+def update_account_cookies(account_id: int, cookies: list):
+    """Update cookies for an account."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            """UPDATE accounts SET
+                   cookies_json = ?,
+                   last_login_at = ?,
+                   status = 'active',
+                   error_message = '',
+                   updated_at = ?
+               WHERE id = ?""",
+            (json.dumps(cookies), now, now, account_id)
+        )
+
+
+def mark_account_error(account_id: int, error: str):
+    """Mark an account as having an error."""
+    update_account(account_id, status="error", error_message=error)
+
+
+def disable_account(account_id: int):
+    """Disable an account."""
+    update_account(account_id, status="disabled")
+
+
+def enable_account(account_id: int):
+    """Re-enable an account."""
+    update_account(account_id, status="active", error_message="")
+
+
+def delete_account(account_id: int):
+    """Delete an account permanently."""
+    with get_db() as conn:
+        conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+
+
+def get_account_by_email(email: str) -> Optional[dict]:
+    """Find account by email."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM accounts WHERE email = ?", (email,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_active_account_count() -> int:
+    """Get number of active accounts."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM accounts WHERE status = 'active'"
+        ).fetchone()
+        return row["cnt"]
+
+
+def get_account_cookies(account_id: int) -> list:
+    """Get parsed cookies for an account."""
+    acct = get_account(account_id)
+    if acct and acct["cookies_json"]:
+        try:
+            return json.loads(acct["cookies_json"])
+        except json.JSONDecodeError:
+            return []
+    return []
 
 
 # ═══════════════════════════════════════════
@@ -98,13 +269,14 @@ def init_db():
 # ═══════════════════════════════════════════
 
 def add_download(doc_id: str, url: str, source: str = "telegram",
-                 user_id: str = "", user_name: str = "") -> int:
+                 user_id: str = "", user_name: str = "",
+                 account_id: int = 0) -> int:
     """Add a new download record. Returns the record ID."""
     with get_db() as conn:
         cursor = conn.execute(
-            """INSERT INTO downloads (doc_id, url, source, user_id, user_name, status)
-               VALUES (?, ?, ?, ?, ?, 'downloading')""",
-            (doc_id, url, source, user_id, user_name)
+            """INSERT INTO downloads (doc_id, url, source, user_id, user_name, account_id, status)
+               VALUES (?, ?, ?, ?, ?, ?, 'downloading')""",
+            (doc_id, url, source, user_id, user_name, account_id)
         )
         return cursor.lastrowid
 
@@ -112,7 +284,8 @@ def add_download(doc_id: str, url: str, source: str = "telegram",
 def update_download(record_id: int, **kwargs):
     """Update a download record with given fields."""
     allowed = {"title", "pages", "file_size", "file_path", "status",
-               "error_message", "started_at", "completed_at", "duration_seconds"}
+               "error_message", "started_at", "completed_at", "duration_seconds",
+               "account_id"}
     fields = {k: v for k, v in kwargs.items() if k in allowed}
     if not fields:
         return
