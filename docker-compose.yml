@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  scribd-bot:
+    build: .
+    container_name: scribd-bot
+    restart: always
+    env_file: .env
+    volumes:
+      - downloads:/tmp/scribd_downloads
+    command: python bot.py
+
+  scribd-api:
+    build: .
+    container_name: scribd-api
+    restart: always
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - downloads:/tmp/scribd_downloads
+    command: python api_server.py
+
+volumes:
+  downloads:

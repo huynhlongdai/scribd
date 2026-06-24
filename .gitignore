@@ -1,0 +1,7 @@
+.env
+cookies.json
+__pycache__/
+*.pyc
+venv/
+/downloads/
+*.pdf
