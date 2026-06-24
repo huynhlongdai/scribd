@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from downloader import download_scribd_document, extract_doc_id, extract_doc_title
+from downloader import download_scribd_document, get_document_info, extract_doc_id, extract_doc_title
 import database as db
 import account_manager as acct_mgr
 
@@ -65,6 +65,43 @@ async def home():
 async def health():
     active_accounts = db.get_active_account_count()
     return {"status": "ok", "active_downloads": _active_count, "active_accounts": active_accounts}
+
+
+@app.post("/api/info")
+async def api_info(req: DownloadRequest):
+    """Get document info without downloading (title, pages, etc.)."""
+    doc_id = extract_doc_id(req.url)
+    if not doc_id:
+        raise HTTPException(400, "Link Scribd không hợp lệ")
+
+    # Check if already downloaded (cache) — return info from DB
+    cached = db.get_cached_download(doc_id)
+    if cached:
+        return {
+            "success": True,
+            "doc_id": doc_id,
+            "title": cached["title"],
+            "pages": cached["pages"],
+            "file_size": cached["file_size"],
+            "cached": True,
+            "download_url": f"/api/file/{doc_id}",
+        }
+
+    # Get account cookies for probing
+    cookies, account_id = acct_mgr.get_cookies_for_download()
+    info = await get_document_info(req.url, cookies_list=cookies)
+
+    if info["success"]:
+        return {
+            "success": True,
+            "doc_id": info["doc_id"],
+            "title": info["title"],
+            "pages": info["pages"],
+            "thumbnail": info.get("thumbnail"),
+            "cached": False,
+        }
+    else:
+        raise HTTPException(400, info.get("error", "Không lấy được thông tin tài liệu"))
 
 
 @app.post("/api/download")
@@ -498,9 +535,43 @@ def get_html() -> str:
             max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
         .dl-link {
-            color: var(--accent2); text-decoration: none; font-weight: 500;
+            display: inline-block; margin-top: 12px; padding: 10px 24px;
+            background: var(--accent); color: #fff; border-radius: 8px;
+            font-weight: 600; text-decoration: none; transition: all 0.2s;
         }
-        .dl-link:hover { text-decoration: underline; }
+        .dl-link:hover { background: #5a4bd1; text-decoration: none; }
+
+        /* File info card */
+        .file-info-card {
+            display: flex; align-items: center; gap: 14px;
+            text-align: left; margin-bottom: 8px;
+        }
+        .file-icon { font-size: 2.2rem; }
+        .file-details { flex: 1; min-width: 0; }
+        .file-title {
+            font-weight: 700; font-size: 1.05rem; color: var(--text);
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .file-meta { font-size: 0.85rem; color: var(--text2); margin-top: 2px; }
+
+        /* Progress bar */
+        .progress-section {
+            margin-top: 10px; font-size: 0.9rem; color: var(--text2);
+        }
+        .progress-bar {
+            width: 100%; height: 6px; background: var(--surface); border-radius: 3px;
+            margin: 8px 0; overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%; width: 0%; background: var(--accent);
+            border-radius: 3px; transition: width 2s ease;
+        }
+
+        /* Status info type */
+        .status-info {
+            background: rgba(108,92,231,0.1); border: 1px solid rgba(108,92,231,0.3);
+            border-radius: 10px; padding: 18px;
+        }
 
         /* Stats */
         .stats-grid {
@@ -639,7 +710,9 @@ def get_html() -> str:
         let pollInterval = null;
         let searchTimeout = null;
 
-        // ═══ Download ═══
+        // ═══ Download Flow: Get Info → Show Info → Download → Show File ═══
+        let _currentDocId = null;
+
         async function startDownload() {
             const url = document.getElementById('urlInput').value.trim();
             if (!url) return;
@@ -649,56 +722,149 @@ def get_html() -> str:
             }
             const btn = document.getElementById('downloadBtn');
             btn.disabled = true;
-            btn.textContent = '⏳ Đang xử lý...';
-            showStatus('downloading', '<span class="spinner"></span> Đang bắt đầu tải...');
+            btn.textContent = '⏳ Đang lấy thông tin...';
+            showStatus('downloading', '<span class="spinner"></span> Bước 1/3 — Đang lấy thông tin tài liệu...');
+
             try {
-                const res = await fetch('/api/download', {
+                // === Step 1: Get document info ===
+                const infoRes = await fetch('/api/info', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({url})
                 });
-                const data = await res.json();
-                if (data.status === 'cached') {
-                    showStatus('cached', `✅ <b>${data.title}</b> (${data.pages} trang) — đã có sẵn!<br><a class="dl-link" href="${data.download_url}" target="_blank">⬇️ Tải PDF</a>`);
-                    btn.disabled = false; btn.textContent = '⬇️ Tải PDF';
-                    loadHistory();
-                } else if (data.status === 'queued') {
-                    showStatus('downloading', `🔄 ${data.message}`);
-                    startPolling(data.doc_id);
-                } else if (data.status === 'started' || data.status === 'downloading') {
-                    showStatus('downloading', '<span class="spinner"></span> Đang tải tài liệu... (30s-2 phút)');
-                    startPolling(data.doc_id);
+                const info = await infoRes.json();
+
+                if (!infoRes.ok || !info.success) {
+                    showStatus('error', `❌ ${info.detail || info.error || 'Không lấy được thông tin'}`);
+                    resetBtn(); return;
+                }
+
+                _currentDocId = info.doc_id;
+
+                // If cached — show file info + download link immediately
+                if (info.cached) {
+                    const sizeMB = info.file_size ? (info.file_size/1024/1024).toFixed(1) + 'MB' : '';
+                    showStatus('success', `
+                        <div class="file-info-card">
+                            <div class="file-icon">📄</div>
+                            <div class="file-details">
+                                <div class="file-title">${info.title}</div>
+                                <div class="file-meta">${info.pages} trang${sizeMB ? ' · ' + sizeMB : ''} · Đã có sẵn!</div>
+                            </div>
+                        </div>
+                        <a class="dl-link" href="${info.download_url}" target="_blank">⬇️ Tải PDF ngay</a>
+                    `);
+                    resetBtn(); loadHistory(); return;
+                }
+
+                // === Step 2: Show document info, start download ===
+                showStatus('info', `
+                    <div class="file-info-card">
+                        <div class="file-icon">📄</div>
+                        <div class="file-details">
+                            <div class="file-title">${info.title}</div>
+                            <div class="file-meta">${info.pages} trang · doc_id: ${info.doc_id}</div>
+                        </div>
+                    </div>
+                    <div class="progress-section">
+                        <span class="spinner"></span> Bước 2/3 — Đang tải tài liệu... (30s-2 phút)
+                        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+                    </div>
+                `);
+                btn.textContent = '⏳ Đang tải...';
+
+                // Start actual download
+                const dlRes = await fetch('/api/download', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({url})
+                });
+                const dlData = await dlRes.json();
+
+                if (dlData.status === 'cached') {
+                    const sizeMB = dlData.file_size ? (dlData.file_size/1024/1024).toFixed(1) + 'MB' : '';
+                    showStatus('success', `
+                        <div class="file-info-card">
+                            <div class="file-icon">✅</div>
+                            <div class="file-details">
+                                <div class="file-title">${dlData.title}</div>
+                                <div class="file-meta">${dlData.pages} trang${sizeMB ? ' · ' + sizeMB : ''}</div>
+                            </div>
+                        </div>
+                        <a class="dl-link" href="${dlData.download_url}" target="_blank">⬇️ Tải PDF ngay</a>
+                    `);
+                    resetBtn(); loadHistory();
+                } else if (dlData.status === 'queued') {
+                    startPolling(dlData.doc_id, info.title, info.pages);
+                } else if (dlData.status === 'started' || dlData.status === 'downloading') {
+                    startPolling(dlData.doc_id, info.title, info.pages);
                 } else {
-                    showStatus('error', `❌ ${data.detail || data.message || 'Lỗi'}`);
-                    btn.disabled = false; btn.textContent = '⬇️ Tải PDF';
+                    showStatus('error', `❌ ${dlData.detail || dlData.message || 'Lỗi'}`);
+                    resetBtn();
                 }
             } catch (e) {
                 showStatus('error', `❌ Lỗi kết nối: ${e.message}`);
-                btn.disabled = false; btn.textContent = '⬇️ Tải PDF';
+                resetBtn();
             }
         }
 
-        function startPolling(docId) {
+        function startPolling(docId, title, pages) {
             if (pollInterval) clearInterval(pollInterval);
+            let elapsed = 0;
+            // Animate progress bar
+            const animProgress = setInterval(() => {
+                elapsed += 3;
+                const pct = Math.min(90, (elapsed / 120) * 100);
+                const fill = document.getElementById('progressFill');
+                if (fill) fill.style.width = pct + '%';
+            }, 3000);
+
             pollInterval = setInterval(async () => {
                 try {
                     const res = await fetch(`/api/status/${docId}`);
                     const data = await res.json();
                     if (data.status === 'completed') {
                         clearInterval(pollInterval); pollInterval = null;
-                        showStatus('success', `✅ <b>${data.title}</b> — ${data.pages} trang (${(data.file_size/1024/1024).toFixed(1)}MB, ${data.duration.toFixed(0)}s)<br><a class="dl-link" href="${data.download_url}" target="_blank">⬇️ Tải PDF ngay</a>`);
-                        document.getElementById('downloadBtn').disabled = false;
-                        document.getElementById('downloadBtn').textContent = '⬇️ Tải PDF';
-                        loadHistory();
+                        clearInterval(animProgress);
+                        const sizeMB = data.file_size ? (data.file_size/1024/1024).toFixed(1) + 'MB' : '';
+                        // === Step 3: Show completed file ===
+                        showStatus('success', `
+                            <div class="file-info-card">
+                                <div class="file-icon">✅</div>
+                                <div class="file-details">
+                                    <div class="file-title">${data.title || title}</div>
+                                    <div class="file-meta">${data.pages || pages} trang · ${sizeMB} · ${data.duration ? data.duration.toFixed(0) + 's' : ''}</div>
+                                </div>
+                            </div>
+                            <div class="progress-section">
+                                <div class="progress-bar"><div class="progress-fill" style="width:100%;background:var(--success)"></div></div>
+                                Bước 3/3 — Hoàn tất! ✅
+                            </div>
+                            <a class="dl-link" href="${data.download_url}" target="_blank">⬇️ Tải PDF ngay</a>
+                        `);
+                        resetBtn(); loadHistory();
                     } else if (data.status === 'failed') {
                         clearInterval(pollInterval); pollInterval = null;
-                        showStatus('error', `❌ ${data.error || 'Tải thất bại'}`);
-                        document.getElementById('downloadBtn').disabled = false;
-                        document.getElementById('downloadBtn').textContent = '⬇️ Tải PDF';
-                        loadHistory();
+                        clearInterval(animProgress);
+                        showStatus('error', `
+                            <div class="file-info-card">
+                                <div class="file-icon">❌</div>
+                                <div class="file-details">
+                                    <div class="file-title">${title || 'Tài liệu'}</div>
+                                    <div class="file-meta">${data.error || 'Tải thất bại'}</div>
+                                </div>
+                            </div>
+                        `);
+                        resetBtn(); loadHistory();
                     }
                 } catch(e) {}
             }, 3000);
+        }
+
+        function resetBtn() {
+            const btn = document.getElementById('downloadBtn');
+            btn.disabled = false;
+            btn.textContent = '⬇️ Tải PDF';
         }
 
         function showStatus(type, html) {

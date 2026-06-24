@@ -1,101 +1,117 @@
-# 📚 Scribd Downloader Bot
+# 📚 Scribd Downloader
 
-Hệ thống tải tài liệu Scribd dưới dạng PDF — hỗ trợ Telegram Bot + Web UI.
+Hệ thống tải tài liệu Scribd đầy đủ tính năng: **Telegram Bot** + **Admin API** + **Public SEO Website**.
 
 ## ✨ Tính năng
 
-### Telegram Bot
-- 📥 Gửi link Scribd → nhận PDF
-- 📋 `/history` — Lịch sử tải
-- 📊 `/stats` — Thống kê
-- 🔄 `/status` — Trạng thái hàng đợi
-- ⚡ Cache thông minh — tải lại tài liệu cũ rất nhanh
-- ⏳ Rate limiting — chống spam
+### 🤖 Telegram Bot (`bot.py`)
+- Gửi link Scribd → nhận file PDF
+- Lệnh: `/start`, `/help`, `/history`, `/stats`, `/accounts`
+- Quản lý tài khoản: `/addaccount`, `/removeaccount`
+- Cache thông minh — không tải lại file đã có
 
-### Web UI
-- 🌐 Giao diện web đẹp, dark theme
-- 📥 Dán link → tải PDF trực tiếp
-- 📋 Lịch sử tải + tìm kiếm
-- 🔄 Hàng đợi real-time
-- 📊 Thống kê chi tiết
+### 🔧 Admin Web API (`web_server.py`) — Port 8000
+- Dashboard quản trị: lịch sử tải, hàng đợi, thống kê
+- Quản lý multi-account Scribd (thêm/xóa/bật/tắt/refresh)
+- API endpoints: `/api/download`, `/api/history`, `/api/accounts`, ...
+- Dark theme UI
 
-### Core Engine
-- 🔧 Dùng embed URL + Playwright headless render
-- 📃 Chụp từng trang → ghép PDF
-- 💾 SQLite database cho lịch sử + queue
-- 🔄 Hỗ trợ tải đồng thời
+### 🌐 Public SEO Website (`public_site.py`) — Port 80
+- Giao diện public siêu nhẹ, tối ưu SEO
+- Trang chủ với download box + trust badges + stats
+- Blog/bài viết tích hợp (hướng dẫn, so sánh, kiến thức)
+- Robots.txt, sitemap.xml, Open Graph, Schema.org
+- FAQ section, responsive mobile
+- Vị trí quảng cáo sẵn sàng gắn Google AdSense
+- Kết nối API backend để tải tài liệu
 
-## 📋 Định dạng hỗ trợ
-
-| Loại | Hỗ trợ |
-|------|--------|
-| Documents/PDF | ✅ |
-| Presentations (PPT) | ✅ |
-| Word docs | ✅ |
-| Spreadsheets | ✅ |
-| Sheet music | ✅ |
-| Books (Everand) | ❌ |
-| Magazines | ❌ |
-
-## 🚀 Cài đặt
-
-### Trên VPS (Ubuntu/Debian):
-```bash
-git clone https://github.com/huynhlongdai/scribd.git /opt/scribd-bot
-cd /opt/scribd-bot
-chmod +x setup.sh && bash setup.sh
-```
-
-### Cấu hình:
-```bash
-nano /opt/scribd-bot/.env
-# Thêm TELEGRAM_BOT_TOKEN=your_token
-```
-
-### Khởi động:
-```bash
-# Telegram Bot
-systemctl start scribd-bot && systemctl enable scribd-bot
-
-# Web UI (port 8000)
-systemctl start scribd-web && systemctl enable scribd-web
-```
-
-### Truy cập:
-- **Web UI:** `http://YOUR_VPS_IP:8000`
-- **Telegram:** Tìm bot và gửi link Scribd
+### 🔄 Core Features
+- **Multi-account rotation** — xoay vòng tài khoản Scribd
+- **Download queue** — hàng đợi khi quá tải
+- **Smart cache** — cache file đã tải, tránh tải lặp
+- **SQLite database** — lưu lịch sử, thống kê, tài khoản
 
 ## 📁 Cấu trúc
 
 ```
-├── downloader.py     # Core download engine
-├── bot.py            # Telegram bot (v2 + history)
-├── web_server.py     # FastAPI web server + UI
-├── database.py       # SQLite database layer
-├── setup.sh          # Auto-setup script
-├── requirements.txt  # Python dependencies
-├── .env.example      # Config template
-├── Dockerfile        # Docker build
-└── docker-compose.yml
+├── bot.py              # Telegram Bot
+├── web_server.py       # Admin API + Dashboard (port 8000)
+├── public_site.py      # Public SEO Website (port 80)
+├── downloader.py       # Core download engine
+├── database.py         # SQLite database layer
+├── account_manager.py  # Multi-account management
+├── articles/           # Blog articles (JSON)
+├── setup.sh            # Auto-setup for VPS
+├── docker-compose.yml  # Docker deployment
+├── Dockerfile
+├── requirements.txt
+└── .env.example
 ```
 
-## 🐳 Docker
+## 🚀 Cài đặt nhanh
 
+### VPS (Ubuntu/Debian)
 ```bash
-cp .env.example .env
-# Edit .env
+git clone https://github.com/huynhlongdai/scribd.git /opt/scribd-bot
+cd /opt/scribd-bot
+chmod +x setup.sh && bash setup.sh
+
+# Cấu hình
+nano .env
+
+# Khởi động
+systemctl start scribd-bot && systemctl enable scribd-bot    # Telegram Bot
+systemctl start scribd-web && systemctl enable scribd-web    # Admin API
+systemctl start scribd-site && systemctl enable scribd-site  # Public Website
+```
+
+### Docker
+```bash
+git clone https://github.com/huynhlongdai/scribd.git
+cd scribd
+cp .env.example .env && nano .env
 docker-compose up -d
 ```
 
-## 📊 API Endpoints
+## ⚙️ Cấu hình (.env)
 
-| Method | URL | Mô tả |
-|--------|-----|--------|
-| GET | `/` | Web UI |
-| POST | `/api/download` | Bắt đầu tải |
-| GET | `/api/status/{doc_id}` | Kiểm tra trạng thái |
-| GET | `/api/file/{doc_id}` | Tải PDF |
-| GET | `/api/history` | Lịch sử tải |
-| GET | `/api/search?q=...` | Tìm kiếm |
-| GET | `/api/queue` | Hàng đợi |
-| GET | `/api/stats` | Thống kê |
+```env
+TELEGRAM_BOT_TOKEN=your_token_here
+DOWNLOAD_DIR=/tmp/scribd_downloads
+DB_PATH=/opt/scribd-bot/scribd_bot.db
+WEB_PORT=8000
+PUBLIC_PORT=80
+SITE_NAME=ScribdGet
+SITE_DOMAIN=scribdget.com
+API_BACKEND=http://localhost:8000
+MAX_CONCURRENT_DOWNLOADS=2
+RATE_LIMIT_SECONDS=30
+```
+
+## 🌐 Truy cập
+
+| Service | URL | Mô tả |
+|---------|-----|--------|
+| Public Website | `http://YOUR_IP` | Trang public cho người dùng |
+| Admin Dashboard | `http://YOUR_IP:8000` | Quản trị (history, accounts, stats) |
+| Telegram Bot | `@YourBot` | Tải qua Telegram |
+
+## 📝 Blog / SEO
+
+Website public tích hợp sẵn:
+- **5 bài viết mẫu** (hướng dẫn, so sánh, kiến thức)
+- **Robots.txt** + **Sitemap.xml** tự động
+- **Schema.org** structured data
+- **Open Graph** + **Twitter Cards**
+- **Vị trí quảng cáo** sẵn sàng cho Google AdSense
+
+Thêm bài viết: sửa file `articles/articles.json` hoặc thêm trực tiếp trong `public_site.py`.
+
+## 📄 Loại tài liệu hỗ trợ
+
+- ✅ Documents (PDF, Word, Text)
+- ✅ Presentations (PowerPoint)
+- ✅ Spreadsheets (Excel)
+- ✅ Sheet Music
+- ❌ Books/Ebooks (Everand)
+- ❌ Magazines

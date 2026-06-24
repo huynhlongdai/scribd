@@ -39,6 +39,110 @@ def extract_doc_title(url: str) -> str:
     return "document"
 
 
+async def get_document_info(
+    url: str,
+    cookies_json: str | None = None,
+    cookies_list: list | None = None,
+    timeout: int = 30,
+) -> dict:
+    """
+    Get document info from Scribd WITHOUT downloading.
+    Fast probe: loads embed page, counts pages, extracts title.
+    
+    Returns:
+        dict with keys: success, doc_id, title, pages, embed_url, error
+    """
+    from playwright.async_api import async_playwright
+    
+    doc_id = extract_doc_id(url)
+    if not doc_id:
+        return {"success": False, "error": "Invalid Scribd URL"}
+    
+    title = extract_doc_title(url)
+    embed_url = f"https://www.scribd.com/embeds/{doc_id}/content"
+    
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+            )
+            context = await browser.new_context(
+                viewport={"width": 1200, "height": 900},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            )
+            
+            # Load cookies
+            raw_cookies = cookies_list
+            if raw_cookies is None and cookies_json and os.path.exists(cookies_json):
+                import json
+                with open(cookies_json) as f:
+                    raw_cookies = json.load(f)
+            
+            if raw_cookies:
+                pw_cookies = []
+                for c in raw_cookies:
+                    pw_cookie = {
+                        "name": c["name"], "value": c["value"],
+                        "domain": c.get("domain", ".scribd.com"),
+                        "path": c.get("path", "/"),
+                    }
+                    if c.get("secure"): pw_cookie["secure"] = True
+                    if c.get("httpOnly"): pw_cookie["httpOnly"] = True
+                    pw_cookies.append(pw_cookie)
+                await context.add_cookies(pw_cookies)
+            
+            page = await context.new_page()
+            
+            try:
+                await page.goto(embed_url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            except Exception:
+                await browser.close()
+                return {"success": False, "error": "Timeout loading document page"}
+            
+            await asyncio.sleep(2)
+            
+            # Count pages
+            page_count = await page.evaluate('document.querySelectorAll(".outer_page").length')
+            if page_count == 0:
+                page_count = await page.evaluate('document.querySelectorAll("[class*=\\"page\\"]").length')
+            
+            # Get title
+            try:
+                page_title = await page.evaluate('''() => {
+                    const t = document.querySelector('title');
+                    return t ? t.textContent.trim() : null;
+                }''')
+                if page_title and page_title != "Scribd":
+                    title = page_title.replace(" | PDF", "").strip()
+            except Exception:
+                pass
+            
+            # Try to get thumbnail/preview image
+            thumbnail = await page.evaluate('''() => {
+                const img = document.querySelector('.outer_page img, [class*="page"] img');
+                return img ? img.src : null;
+            }''')
+            
+            await browser.close()
+            
+            if page_count == 0:
+                return {"success": False, "error": "Could not find document pages. May be restricted."}
+            
+            return {
+                "success": True,
+                "doc_id": doc_id,
+                "title": title,
+                "pages": page_count,
+                "embed_url": embed_url,
+                "url": url,
+                "thumbnail": thumbnail,
+            }
+    except Exception as e:
+        logger.error(f"Info probe failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
 async def download_scribd_document(
     url: str,
     output_dir: str = "/tmp/scribd_downloads",

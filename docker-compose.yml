@@ -8,18 +8,37 @@ services:
     env_file: .env
     volumes:
       - downloads:/tmp/scribd_downloads
+      - dbdata:/app/data
     command: python bot.py
 
-  scribd-api:
+  scribd-web:
     build: .
-    container_name: scribd-api
+    container_name: scribd-web
     restart: always
     env_file: .env
     ports:
       - "8000:8000"
     volumes:
       - downloads:/tmp/scribd_downloads
-    command: python api_server.py
+      - dbdata:/app/data
+    command: python web_server.py
+
+  scribd-site:
+    build: .
+    container_name: scribd-site
+    restart: always
+    env_file: .env
+    ports:
+      - "80:80"
+    volumes:
+      - downloads:/tmp/scribd_downloads
+      - dbdata:/app/data
+      - articles:/app/articles
+    command: python public_site.py
+    depends_on:
+      - scribd-web
 
 volumes:
   downloads:
+  dbdata:
+  articles:

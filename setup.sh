@@ -37,6 +37,7 @@ playwright install-deps chromium 2>/dev/null || apt-get install -y -qq \
 # 4. Create download directory
 echo "[4/5] Creating directories..."
 mkdir -p /tmp/scribd_downloads
+mkdir -p "$APP_DIR/articles"
 
 # 5. Create .env if not exists
 if [ ! -f "$APP_DIR/.env" ]; then
@@ -49,6 +50,10 @@ COOKIES_PATH=
 RATE_LIMIT_SECONDS=30
 MAX_QUEUE_SIZE=10
 WEB_PORT=8000
+PUBLIC_PORT=80
+SITE_NAME=ScribdGet
+SITE_DOMAIN=scribdget.com
+API_BACKEND=http://localhost:8000
 MAX_CONCURRENT_DOWNLOADS=2
 ENVEOF
     echo "    ⚠️  Edit .env to add your Telegram bot token!"
@@ -78,10 +83,10 @@ RestartSec=10
 WantedBy=multi-user.target
 SVCEOF
 
-# Web Server Service
+# Web Server Service (Admin API - port 8000)
 cat > /etc/systemd/system/scribd-web.service << SVCEOF
 [Unit]
-Description=Scribd Downloader Web Server
+Description=Scribd Downloader Web API Server
 After=network.target
 
 [Service]
@@ -90,6 +95,25 @@ User=root
 WorkingDirectory=$APP_DIR
 EnvironmentFile=$APP_DIR/.env
 ExecStart=$VENV_DIR/bin/python web_server.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+# Public SEO Website (port 80)
+cat > /etc/systemd/system/scribd-site.service << SVCEOF
+[Unit]
+Description=Scribd Downloader Public Website (SEO)
+After=network.target scribd-web.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$APP_DIR/.env
+ExecStart=$VENV_DIR/bin/python public_site.py
 Restart=always
 RestartSec=10
 
@@ -107,9 +131,15 @@ echo ""
 echo "  Next steps:"
 echo "  1. Edit .env:  nano $APP_DIR/.env"
 echo "  2. Start bot:  systemctl start scribd-bot && systemctl enable scribd-bot"
-echo "  3. Start web:  systemctl start scribd-web && systemctl enable scribd-web"
+echo "  3. Start API:  systemctl start scribd-web && systemctl enable scribd-web"
+echo "  4. Start site: systemctl start scribd-site && systemctl enable scribd-site"
 echo ""
-echo "  Web UI: http://YOUR_VPS_IP:8000"
-echo "  Logs:   journalctl -u scribd-bot -f"
-echo "          journalctl -u scribd-web -f"
+echo "  🌐 Public website:  http://YOUR_VPS_IP (port 80)"
+echo "  🔧 Admin API:       http://YOUR_VPS_IP:8000"
+echo "  📱 Telegram Bot:    send /start to your bot"
+echo ""
+echo "  Logs:"
+echo "    journalctl -u scribd-bot -f"
+echo "    journalctl -u scribd-web -f"
+echo "    journalctl -u scribd-site -f"
 echo ""
