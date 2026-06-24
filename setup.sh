@@ -1,67 +1,66 @@
 #!/bin/bash
-# ═══════════════════════════════════════════════════════════
-# Scribd Downloader Bot - Setup Script
-# Cài đặt tự động trên Ubuntu/Debian VPS
-# ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
+# Scribd Downloader Bot - Auto Setup Script
+# For Ubuntu/Debian VPS
+# ═══════════════════════════════════════════
 
 set -e
 
-echo "📚 Scribd Downloader Bot - Setup"
-echo "================================="
+APP_DIR="/opt/scribd-bot"
+VENV_DIR="$APP_DIR/venv"
 
-# Colors
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+echo "═══════════════════════════════════════════"
+echo "  📚 Scribd Downloader Bot - Setup"
+echo "═══════════════════════════════════════════"
 
-# Check if running as root
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}Vui lòng chạy với quyền root: sudo bash setup.sh${NC}"
-    exit 1
-fi
-
-# ─── System Dependencies ───
-echo -e "\n${GREEN}[1/5] Cài đặt system dependencies...${NC}"
+# 1. System packages
+echo "[1/5] Installing system packages..."
 apt-get update -qq
-apt-get install -y -qq python3 python3-pip python3-venv git curl wget > /dev/null 2>&1
-echo "  ✅ System dependencies OK"
+apt-get install -y -qq python3 python3-pip python3-venv git curl wget
 
-# ─── Project Directory ───
-echo -e "\n${GREEN}[2/5] Tạo project directory...${NC}"
-PROJECT_DIR="/opt/scribd-bot"
-mkdir -p "$PROJECT_DIR"
-cp -r "$(dirname "$0")"/* "$PROJECT_DIR/" 2>/dev/null || true
-cd "$PROJECT_DIR"
-echo "  ✅ Project dir: $PROJECT_DIR"
-
-# ─── Python Virtual Environment ───
-echo -e "\n${GREEN}[3/5] Tạo Python virtual environment...${NC}"
-python3 -m venv venv
-source venv/bin/activate
+# 2. Python virtual environment
+echo "[2/5] Setting up Python environment..."
+cd "$APP_DIR"
+python3 -m venv "$VENV_DIR"
+source "$VENV_DIR/bin/activate"
 pip install --upgrade pip -q
 pip install -r requirements.txt -q
-echo "  ✅ Python dependencies OK"
 
-# ─── Playwright Browser ───
-echo -e "\n${GREEN}[4/5] Cài đặt Playwright browser...${NC}"
+# 3. Playwright + Chromium
+echo "[3/5] Installing Playwright + Chromium (may take a few minutes)..."
 playwright install chromium
-playwright install-deps chromium 2>/dev/null || true
-echo "  ✅ Playwright Chromium OK"
+playwright install-deps chromium 2>/dev/null || apt-get install -y -qq \
+    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+    libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 \
+    libgbm1 libpango-1.0-0 libcairo2 libasound2 libxshmfence1 || true
 
-# ─── Environment Configuration ───
-echo -e "\n${GREEN}[5/5] Cấu hình environment...${NC}"
-if [ ! -f "$PROJECT_DIR/.env" ]; then
-    cp "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env"
-    echo -e "  ${YELLOW}⚠️  Vui lòng chỉnh sửa file .env:${NC}"
-    echo "     nano $PROJECT_DIR/.env"
-    echo "     → Thêm TELEGRAM_BOT_TOKEN"
+# 4. Create download directory
+echo "[4/5] Creating directories..."
+mkdir -p /tmp/scribd_downloads
+
+# 5. Create .env if not exists
+if [ ! -f "$APP_DIR/.env" ]; then
+    echo "[5/5] Creating .env template..."
+    cat > "$APP_DIR/.env" << 'ENVEOF'
+TELEGRAM_BOT_TOKEN=YOUR_TOKEN_HERE
+DOWNLOAD_DIR=/tmp/scribd_downloads
+DB_PATH=/opt/scribd-bot/scribd_bot.db
+COOKIES_PATH=
+RATE_LIMIT_SECONDS=30
+MAX_QUEUE_SIZE=10
+WEB_PORT=8000
+MAX_CONCURRENT_DOWNLOADS=2
+ENVEOF
+    echo "    ⚠️  Edit .env to add your Telegram bot token!"
 else
-    echo "  ✅ .env file already exists"
+    echo "[5/5] .env already exists, skipping..."
 fi
 
-# ─── Create systemd service ───
-cat > /etc/systemd/system/scribd-bot.service << 'EOF'
+# Create systemd services
+echo "Creating systemd services..."
+
+# Telegram Bot Service
+cat > /etc/systemd/system/scribd-bot.service << SVCEOF
 [Unit]
 Description=Scribd Downloader Telegram Bot
 After=network.target
@@ -69,59 +68,48 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/scribd-bot
-EnvironmentFile=/opt/scribd-bot/.env
-ExecStart=/opt/scribd-bot/venv/bin/python bot.py
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$APP_DIR/.env
+ExecStart=$VENV_DIR/bin/python bot.py
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SVCEOF
 
-# API server service (optional)
-cat > /etc/systemd/system/scribd-api.service << 'EOF'
+# Web Server Service
+cat > /etc/systemd/system/scribd-web.service << SVCEOF
 [Unit]
-Description=Scribd Downloader API Server
+Description=Scribd Downloader Web Server
 After=network.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/scribd-bot
-EnvironmentFile=/opt/scribd-bot/.env
-ExecStart=/opt/scribd-bot/venv/bin/python api_server.py
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$APP_DIR/.env
+ExecStart=$VENV_DIR/bin/python web_server.py
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SVCEOF
 
 systemctl daemon-reload
 
 echo ""
-echo "═══════════════════════════════════════════════════"
-echo -e "${GREEN}✅ Cài đặt hoàn tất!${NC}"
-echo "═══════════════════════════════════════════════════"
+echo "═══════════════════════════════════════════"
+echo "  ✅ Setup complete!"
+echo "═══════════════════════════════════════════"
 echo ""
-echo "📝 Các bước tiếp theo:"
+echo "  Next steps:"
+echo "  1. Edit .env:  nano $APP_DIR/.env"
+echo "  2. Start bot:  systemctl start scribd-bot && systemctl enable scribd-bot"
+echo "  3. Start web:  systemctl start scribd-web && systemctl enable scribd-web"
 echo ""
-echo "  1. Chỉnh sửa token trong .env:"
-echo "     nano /opt/scribd-bot/.env"
+echo "  Web UI: http://YOUR_VPS_IP:8000"
+echo "  Logs:   journalctl -u scribd-bot -f"
+echo "          journalctl -u scribd-web -f"
 echo ""
-echo "  2. Khởi động Telegram Bot:"
-echo "     systemctl start scribd-bot"
-echo "     systemctl enable scribd-bot"
-echo ""
-echo "  3. (Tuỳ chọn) Khởi động API Server:"
-echo "     systemctl start scribd-api"
-echo "     systemctl enable scribd-api"
-echo ""
-echo "  4. Xem logs:"
-echo "     journalctl -u scribd-bot -f"
-echo "     journalctl -u scribd-api -f"
-echo ""
-echo "  5. Test bot: Gửi link Scribd cho bot trên Telegram"
-echo ""
-echo "═══════════════════════════════════════════════════"

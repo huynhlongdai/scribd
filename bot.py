@@ -1,12 +1,14 @@
 """
-Scribd Telegram Bot
+Scribd Telegram Bot (v2)
 Send a Scribd link → get a PDF back.
 
 Features:
 - Download Scribd documents as PDF
+- Download history with /history command
 - Queue system for multiple requests
 - Rate limiting per user
-- Admin commands for stats
+- Cache: re-download same doc returns cached file
+- Admin stats with /stats
 """
 
 import asyncio
@@ -28,6 +30,7 @@ from telegram.ext import (
 )
 
 from downloader import download_scribd_document, extract_doc_id
+import database as db
 
 # Configuration
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -45,26 +48,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # State
-download_queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
 user_last_request: dict[int, float] = defaultdict(float)
-stats = {
-    "total_downloads": 0,
-    "successful": 0,
-    "failed": 0,
-    "start_time": time.time(),
-}
 active_downloads: dict[int, str] = {}  # user_id -> doc_url
+bot_start_time = time.time()
 
 
 def is_scribd_url(text: str) -> bool:
-    """Check if text contains a Scribd URL."""
     return bool(re.search(r'scribd\.com/(doc(ument)?|presentation|embeds)/\d+', text))
 
 
 def extract_url(text: str) -> str | None:
-    """Extract Scribd URL from message text."""
     match = re.search(r'https?://[^\s]*scribd\.com/[^\s]+', text)
     return match.group(0) if match else None
+
+
+def format_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes}B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f}KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f}MB"
 
 
 # ═══════════════════════════════════════════
@@ -72,7 +76,6 @@ def extract_url(text: str) -> str | None:
 # ═══════════════════════════════════════════
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
     welcome = (
         "📚 *Scribd Downloader Bot*\n\n"
         "Gửi link Scribd để tải tài liệu dưới dạng PDF\\.\n\n"
@@ -80,63 +83,112 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1\\. Copy link tài liệu từ Scribd\n"
         "2\\. Gửi link vào chat\n"
         "3\\. Đợi bot tải và gửi PDF cho bạn\n\n"
-        "*Ví dụ:*\n"
-        "`https://www\\.scribd\\.com/document/123456/Ten\\-Tai\\-Lieu`\n\n"
         "*Lệnh:*\n"
-        "/start \\- Hiển thị hướng dẫn\n"
-        "/status \\- Xem trạng thái hàng đợi\n"
+        "/start \\- Hướng dẫn\n"
+        "/history \\- Lịch sử tải\n"
+        "/status \\- Trạng thái hàng đợi\n"
+        "/stats \\- Thống kê\n"
         "/help \\- Trợ giúp"
     )
     await update.message.reply_text(welcome, parse_mode="MarkdownV2")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command."""
     help_text = (
         "📖 *Hướng dẫn sử dụng*\n\n"
         "*Các định dạng link được hỗ trợ:*\n"
-        "• `scribd\\.com/document/ID/title`\n"
-        "• `scribd\\.com/doc/ID/title`\n"
-        "• `scribd\\.com/presentation/ID/title`\n\n"
+        "• `scribd.com/document/ID/title`\n"
+        "• `scribd.com/doc/ID/title`\n"
+        "• `scribd.com/presentation/ID/title`\n\n"
+        "*Hỗ trợ:* Documents, PDF, PPT, Word, Excel, Sheet music\n"
+        "*Không hỗ trợ:* Books (Everand), Magazines\n\n"
         "*Lưu ý:*\n"
-        "• Bot tải dưới dạng PDF hình ảnh \\(image\\-based PDF\\)\n"
-        "• Thời gian tải phụ thuộc vào số trang\n"
+        "• PDF dạng hình ảnh (image-based)\n"
+        "• Tài liệu đã tải sẽ được cache\n"
         "• Giới hạn 1 yêu cầu mỗi 30 giây"
     )
-    await update.message.reply_text(help_text, parse_mode="MarkdownV2")
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show download history for this user."""
+    user_id = str(update.effective_user.id)
+
+    # Get all history (filter by user_id in telegram source)
+    all_history = db.get_download_history(limit=100, source="telegram")
+    # Filter by user
+    user_history = [h for h in all_history if h["user_id"] == user_id][:10]
+
+    if not user_history:
+        await update.message.reply_text("📭 Bạn chưa có lịch sử tải nào.")
+        return
+
+    lines = ["📋 *Lịch sử tải gần đây:*\n"]
+    for i, h in enumerate(user_history, 1):
+        icon = "✅" if h["status"] == "completed" else "❌" if h["status"] == "failed" else "⏳"
+        title = h["title"] or h["doc_id"]
+        if len(title) > 40:
+            title = title[:37] + "..."
+        pages_info = f" ({h['pages']}p)" if h["pages"] else ""
+        size_info = f" {format_size(h['file_size'])}" if h["file_size"] else ""
+        lines.append(f"{icon} {i}. {title}{pages_info}{size_info}")
+
+    total = len([h for h in all_history if h["user_id"] == user_id])
+    lines.append(f"\n📊 Tổng: {total} lượt tải")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command."""
-    uptime = int(time.time() - stats["start_time"])
+    uptime = int(time.time() - bot_start_time)
     hours, remainder = divmod(uptime, 3600)
     minutes, seconds = divmod(remainder, 60)
-    
+
+    summary = db.get_stats_summary()
+    queue = db.get_queue_status()
+
     status = (
         f"📊 *Trạng thái Bot*\n\n"
         f"⏱ Uptime: {hours}h {minutes}m {seconds}s\n"
-        f"📥 Tổng yêu cầu: {stats['total_downloads']}\n"
-        f"✅ Thành công: {stats['successful']}\n"
-        f"❌ Thất bại: {stats['failed']}\n"
-        f"🔄 Đang xử lý: {len(active_downloads)}\n"
-        f"📋 Hàng đợi: {download_queue.qsize()}/{MAX_QUEUE_SIZE}"
+        f"📥 Tổng yêu cầu: {summary.get('total', 0)}\n"
+        f"✅ Thành công: {summary.get('successful', 0)}\n"
+        f"❌ Thất bại: {summary.get('failed', 0)}\n"
+        f"🔄 Đang xử lý: {summary.get('active', 0)}\n"
+        f"📋 Hàng đợi: {queue.get('waiting', 0)}"
     )
     await update.message.reply_text(status, parse_mode="Markdown")
 
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detailed stats (for admins or all users)."""
+    summary = db.get_stats_summary()
+    total_mb = (summary.get("total_bytes") or 0) / 1024 / 1024
+    avg_dur = summary.get("avg_duration") or 0
+
+    text = (
+        f"📊 *Thống kê chi tiết*\n\n"
+        f"📥 Tổng tải: {summary.get('total', 0)}\n"
+        f"✅ Thành công: {summary.get('successful', 0)}\n"
+        f"❌ Thất bại: {summary.get('failed', 0)}\n"
+        f"📃 Tổng trang: {summary.get('total_pages', 0)}\n"
+        f"💾 Dung lượng: {total_mb:.1f}MB\n"
+        f"⏱ TB thời gian: {avg_dur:.0f}s\n"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 # ═══════════════════════════════════════════
-# Message Handlers
+# Message Handler
 # ═══════════════════════════════════════════
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming messages with Scribd URLs."""
     if not update.message or not update.message.text:
         return
-    
+
     text = update.message.text.strip()
     user_id = update.effective_user.id
-    
-    # Extract URL
+    user_name = update.effective_user.full_name or ""
+
     url = extract_url(text)
     if not url:
         if "scribd" in text.lower():
@@ -147,67 +199,86 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         return
-    
-    # Validate URL
+
     doc_id = extract_doc_id(url)
     if not doc_id:
-        await update.message.reply_text("❌ Link Scribd không hợp lệ. Không tìm thấy document ID.")
+        await update.message.reply_text("❌ Link Scribd không hợp lệ.")
         return
-    
+
+    # Check cache
+    cached = db.get_cached_download(doc_id)
+    if cached and os.path.exists(cached["file_path"]):
+        await update.message.reply_text(
+            f"📦 Đã có trong cache! Đang gửi lại..."
+        )
+        try:
+            with open(cached["file_path"], 'rb') as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=os.path.basename(cached["file_path"]),
+                    caption=f"📚 {cached['title']}\n📃 {cached['pages']} trang (cache)",
+                )
+            # Log as new download too
+            rid = db.add_download(doc_id, url, source="telegram",
+                                  user_id=str(user_id), user_name=user_name)
+            db.mark_download_success(
+                rid, cached["title"], cached["pages"],
+                cached["file_size"], cached["file_path"], 0
+            )
+            return
+        except Exception as e:
+            logger.warning(f"Cache send failed: {e}")
+
     # Rate limiting
     now = time.time()
     time_since_last = now - user_last_request[user_id]
     if time_since_last < RATE_LIMIT_SECONDS:
         wait = int(RATE_LIMIT_SECONDS - time_since_last)
-        await update.message.reply_text(f"⏳ Vui lòng đợi {wait} giây trước khi gửi yêu cầu mới.")
+        await update.message.reply_text(f"⏳ Vui lòng đợi {wait} giây.")
         return
-    
-    # Check if user already has active download
+
     if user_id in active_downloads:
-        await update.message.reply_text("⏳ Bạn đã có 1 yêu cầu đang xử lý. Vui lòng đợi hoàn tất.")
+        await update.message.reply_text("⏳ Bạn đã có 1 yêu cầu đang xử lý.")
         return
-    
+
     user_last_request[user_id] = now
-    
-    # Process download
+
     status_msg = await update.message.reply_text(
         f"📥 Đang tải tài liệu...\n"
-        f"📄 Document ID: `{doc_id}`\n"
-        f"⏳ Vui lòng đợi...",
+        f"📄 Doc ID: `{doc_id}`\n"
+        f"⏳ Vui lòng đợi (30s - 2 phút)...",
         parse_mode="Markdown"
     )
-    
+
     active_downloads[user_id] = url
-    stats["total_downloads"] += 1
-    
+    record_id = db.add_download(doc_id, url, source="telegram",
+                                user_id=str(user_id), user_name=user_name)
+    start_time = time.time()
+
     try:
-        # Download
         cookies_path = COOKIES_PATH if COOKIES_PATH and os.path.exists(COOKIES_PATH) else None
         result = await download_scribd_document(
             url=url,
             output_dir=DOWNLOAD_DIR,
             cookies_json=cookies_path,
         )
-        
+        duration = time.time() - start_time
+
         if result["success"]:
             pdf_path = result["pdf_path"]
             title = result["title"]
             pages = result["pages"]
-            
-            # Update status
-            await status_msg.edit_text(
-                f"✅ Tải thành công!\n"
-                f"📄 {title}\n"
-                f"📃 {pages} trang\n"
-                f"📤 Đang gửi file..."
-            )
-            
-            # Send PDF file
             file_size = os.path.getsize(pdf_path)
-            if file_size > 50 * 1024 * 1024:  # 50MB Telegram limit
+
+            db.mark_download_success(record_id, title, pages, file_size, pdf_path, duration)
+
+            await status_msg.edit_text(
+                f"✅ Tải xong!\n📄 {title}\n📃 {pages} trang • {format_size(file_size)} • {duration:.0f}s\n📤 Đang gửi..."
+            )
+
+            if file_size > 50 * 1024 * 1024:
                 await status_msg.edit_text(
-                    f"⚠️ File quá lớn ({file_size // (1024*1024)}MB).\n"
-                    f"Telegram giới hạn 50MB."
+                    f"⚠️ File quá lớn ({format_size(file_size)}).\nTelegram giới hạn 50MB."
                 )
             else:
                 with open(pdf_path, 'rb') as f:
@@ -217,26 +288,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         caption=f"📚 {title}\n📃 {pages} trang",
                     )
                 await status_msg.delete()
-            
-            # Cleanup PDF
-            try:
-                os.remove(pdf_path)
-            except Exception:
-                pass
-            
-            stats["successful"] += 1
-            logger.info(f"Download successful: {doc_id} - {title} ({pages} pages)")
-        
+
+            logger.info(f"✅ {doc_id}: {title} ({pages}p, {duration:.1f}s)")
         else:
+            db.mark_download_failed(record_id, result["error"], duration)
             await status_msg.edit_text(f"❌ Lỗi: {result['error']}")
-            stats["failed"] += 1
-            logger.error(f"Download failed: {doc_id} - {result['error']}")
-    
+            logger.error(f"❌ {doc_id}: {result['error']}")
+
     except Exception as e:
-        await status_msg.edit_text(f"❌ Lỗi không xác định: {str(e)[:200]}")
-        stats["failed"] += 1
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-    
+        duration = time.time() - start_time
+        db.mark_download_failed(record_id, str(e), duration)
+        await status_msg.edit_text(f"❌ Lỗi: {str(e)[:200]}")
+        logger.error(f"❌ Error: {e}", exc_info=True)
+
     finally:
         active_downloads.pop(user_id, None)
 
@@ -246,32 +310,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════
 
 def main():
-    """Start the bot."""
     if not BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN environment variable is required!")
-        print("   1. Talk to @BotFather on Telegram")
-        print("   2. Create a new bot with /newbot")
-        print("   3. Copy the token")
-        print("   4. Set: export TELEGRAM_BOT_TOKEN='your-token-here'")
+        print("❌ TELEGRAM_BOT_TOKEN chưa được cấu hình!")
+        print("   export TELEGRAM_BOT_TOKEN='your-token-here'")
         return
-    
+
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    
-    # Build application
+
     app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Register handlers
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    logger.info("🤖 Bot started! Waiting for messages...")
-    print("🤖 Scribd Downloader Bot is running!")
+
+    logger.info("🤖 Bot started!")
+    print("🤖 Scribd Downloader Bot v2 is running!")
     print(f"   Download dir: {DOWNLOAD_DIR}")
     print(f"   Rate limit: {RATE_LIMIT_SECONDS}s")
-    print(f"   Max queue: {MAX_QUEUE_SIZE}")
-    
+
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
