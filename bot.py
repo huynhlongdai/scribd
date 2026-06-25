@@ -32,6 +32,7 @@ from telegram.ext import (
 from downloader import download_scribd_document, extract_doc_id
 import database as db
 import account_manager as acct_mgr
+import ai_helper
 
 # Configuration
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -262,18 +263,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_name = update.effective_user.full_name or ""
 
-    url = extract_url(text)
-    if not url:
-        if "scribd" in text.lower():
+    # 🤖 AI Smart Parse
+    parsed = ai_helper.smart_parse_input(text)
+
+    if parsed["type"] == "search_query" or not parsed["fixed_url"]:
+        if "scribd" in text.lower() or parsed["confidence"] > 0.1:
+            suggestions = "\n".join(parsed.get("suggestions", []))
             await update.message.reply_text(
-                "⚠️ Không tìm thấy link Scribd hợp lệ.\n"
-                "Vui lòng gửi link đầy đủ, ví dụ:\n"
-                "`https://www.scribd.com/document/123456/Title`",
-                parse_mode="Markdown"
+                f"🤖 *AI:* Không nhận dạng được link Scribd\\.\n\n"
+                f"{suggestions}\n\n"
+                f"Ví dụ: `https://www\\.scribd\\.com/document/123456/Title`",
+                parse_mode="MarkdownV2"
             )
         return
 
-    doc_id = extract_doc_id(url)
+    url = parsed["fixed_url"]
+    doc_id = parsed.get("doc_id") or extract_doc_id(url)
+
+    # Show AI fix info if URL was modified
+    if parsed.get("issues") and parsed["fixed_url"] != text.strip():
+        fixes = ", ".join(parsed["issues"])
+        await update.message.reply_text(f"🤖 AI đã sửa link: {fixes}")
+
     if not doc_id:
         await update.message.reply_text("❌ Link Scribd không hợp lệ.")
         return
@@ -370,14 +381,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             logger.info(f"✅ {doc_id}: {title} ({pages}p, {duration:.1f}s)")
         else:
+            # 🤖 AI Error Diagnosis
+            diagnosis = ai_helper.diagnose_download_error(result["error"], url, doc_id)
             db.mark_download_failed(record_id, result["error"], duration)
-            await status_msg.edit_text(f"❌ Lỗi: {result['error']}")
-            logger.error(f"❌ {doc_id}: {result['error']}")
+
+            diag_text = (
+                f"❌ *Lỗi tải tài liệu*\n\n"
+                f"🤖 *AI Chẩn đoán:* {diagnosis['diagnosis']}\n\n"
+            )
+            for s in diagnosis["suggestions"]:
+                diag_text += f"  {s}\n"
+            if diagnosis["can_retry"]:
+                diag_text += f"\n💡 Gửi lại link để thử lại."
+
+            await status_msg.edit_text(diag_text, parse_mode="Markdown")
+            logger.error(f"❌ {doc_id}: {result['error']} | AI: {diagnosis['error_type']}")
 
     except Exception as e:
         duration = time.time() - start_time
+        diagnosis = ai_helper.diagnose_download_error(str(e), url, doc_id)
         db.mark_download_failed(record_id, str(e), duration)
-        await status_msg.edit_text(f"❌ Lỗi: {str(e)[:200]}")
+        await status_msg.edit_text(
+            f"❌ Lỗi: {str(e)[:150]}\n\n"
+            f"🤖 AI: {diagnosis['diagnosis']}"
+        )
         logger.error(f"❌ Error: {e}", exc_info=True)
 
     finally:

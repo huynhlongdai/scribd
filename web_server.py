@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from downloader import download_scribd_document, get_document_info, extract_doc_id, extract_doc_title
 import database as db
 import account_manager as acct_mgr
+import ai_helper
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -70,7 +71,11 @@ async def health():
 @app.post("/api/info")
 async def api_info(req: DownloadRequest):
     """Get document info without downloading (title, pages, etc.)."""
-    doc_id = extract_doc_id(req.url)
+    # AI-powered URL parsing: try smart parse first
+    parsed = ai_helper.smart_parse_input(req.url)
+    if parsed["fixed_url"]:
+        req.url = parsed["fixed_url"]
+    doc_id = parsed.get("doc_id") or extract_doc_id(req.url)
     if not doc_id:
         raise HTTPException(400, "Link Scribd không hợp lệ")
 
@@ -107,7 +112,11 @@ async def api_info(req: DownloadRequest):
 @app.post("/api/download")
 async def api_download(req: DownloadRequest, background_tasks: BackgroundTasks):
     """Start a download or return cached result."""
-    doc_id = extract_doc_id(req.url)
+    # AI-powered URL parsing
+    parsed = ai_helper.smart_parse_input(req.url)
+    if parsed["fixed_url"]:
+        req.url = parsed["fixed_url"]
+    doc_id = parsed.get("doc_id") or extract_doc_id(req.url)
     if not doc_id:
         raise HTTPException(400, "Link Scribd không hợp lệ")
 
@@ -217,6 +226,93 @@ async def get_stats():
     summary = db.get_stats_summary()
     daily = db.get_daily_stats(30)
     return {"summary": summary, "daily": daily}
+
+
+# ═══════════════════════════════════════════
+# AI Helper API Endpoints
+# ═══════════════════════════════════════════
+
+class AIParseRequest(BaseModel):
+    text: str
+
+
+class AIRetryRequest(BaseModel):
+    doc_id: str
+    error: str = ""
+    url: str = ""
+
+
+@app.post("/api/ai/parse")
+async def ai_parse(req: AIParseRequest):
+    """AI-powered smart input parser. Extracts/fixes Scribd URLs from any text."""
+    result = ai_helper.smart_parse_input(req.text)
+    return result
+
+
+@app.post("/api/ai/fix")
+async def ai_fix(req: AIParseRequest):
+    """AI URL fixer. Normalizes and repairs broken Scribd URLs."""
+    result = ai_helper.fix_scribd_url(req.text)
+    return result
+
+
+@app.post("/api/ai/diagnose")
+async def ai_diagnose(req: AIRetryRequest):
+    """Diagnose a download error and suggest fixes."""
+    diagnosis = ai_helper.diagnose_download_error(req.error, req.url, req.doc_id)
+    alternatives = ai_helper.get_alternative_urls(req.doc_id) if req.doc_id else []
+    return {"diagnosis": diagnosis, "alternatives": alternatives}
+
+
+@app.post("/api/ai/retry")
+async def ai_retry(req: AIRetryRequest, background_tasks: BackgroundTasks):
+    """
+    AI-assisted smart retry: diagnose error, fix URL, and retry download.
+    """
+    # Get diagnosis
+    diagnosis = ai_helper.diagnose_download_error(req.error, req.url, req.doc_id)
+    action = diagnosis.get("auto_fix_action", "retry")
+
+    # Determine URL to use
+    retry_url = req.url
+    if action and action.startswith("retry_with_url:"):
+        retry_url = action.split(":", 1)[1]
+
+    doc_id = req.doc_id or extract_doc_id(retry_url)
+    if not doc_id:
+        return {"success": False, "diagnosis": diagnosis, "error": "Không có doc_id để retry"}
+
+    # Handle cookie refresh
+    if action == "refresh_cookies_and_retry":
+        accounts = db.get_all_accounts()
+        for acct in accounts:
+            if acct["status"] == "active":
+                try:
+                    await acct_mgr.refresh_account_cookies(acct["id"])
+                except Exception:
+                    pass
+
+    # Get fresh cookies
+    cookies, account_id = acct_mgr.get_cookies_for_download()
+
+    # Set longer timeout if needed
+    extra_kwargs = {}
+    if action == "retry_with_longer_timeout":
+        extra_kwargs["timeout"] = 240  # Double the default
+
+    # Start retry download
+    record_id = db.add_download(doc_id, retry_url, source="web-ai-retry", account_id=account_id)
+    background_tasks.add_task(_do_download, doc_id, retry_url, record_id, cookies, account_id)
+
+    return {
+        "success": True,
+        "status": "retrying",
+        "doc_id": doc_id,
+        "url": retry_url,
+        "diagnosis": diagnosis,
+        "action_taken": action,
+        "record_id": record_id,
+    }
 
 
 # ═══════════════════════════════════════════
@@ -367,8 +463,11 @@ async def _do_download(doc_id: str, url: str, record_id: int,
             logger.info(f"✅ Downloaded {doc_id}: {result['title']} "
                         f"({result['pages']}p, {duration:.1f}s, acct#{account_id})")
         else:
-            db.mark_download_failed(record_id, result["error"], duration)
-            logger.error(f"❌ Failed {doc_id}: {result['error']}")
+            # AI diagnosis on failure
+            diagnosis = ai_helper.diagnose_download_error(result["error"], url, doc_id)
+            error_detail = f"{result['error']} | AI: {diagnosis['diagnosis']}"
+            db.mark_download_failed(record_id, error_detail, duration)
+            logger.error(f"❌ Failed {doc_id}: {result['error']} | AI: {diagnosis['error_type']}")
     except Exception as e:
         duration = time.time() - start_time
         db.mark_download_failed(record_id, str(e), duration)
@@ -573,6 +672,32 @@ def get_html() -> str:
             border-radius: 10px; padding: 18px;
         }
 
+        /* AI Diagnosis */
+        .ai-diagnosis {
+            margin-top: 12px; text-align: left;
+            background: var(--surface2); border-radius: 10px;
+            padding: 16px; border-left: 3px solid var(--accent);
+        }
+        .ai-header {
+            font-size: 0.95rem; margin-bottom: 10px;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .ai-body p { font-size: 0.9rem; margin-bottom: 8px; line-height: 1.5; }
+        .ai-suggestion {
+            font-size: 0.85rem; padding: 6px 10px;
+            background: rgba(108,92,231,0.08); border-radius: 6px;
+            margin-bottom: 4px; color: var(--text2);
+        }
+        .ai-retry-btn {
+            margin-top: 12px; padding: 10px 22px !important;
+            font-size: 0.9rem !important;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(108,92,231,0.4); }
+            50% { box-shadow: 0 0 0 8px rgba(108,92,231,0); }
+        }
+
         /* Stats */
         .stats-grid {
             display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -710,20 +835,54 @@ def get_html() -> str:
         let pollInterval = null;
         let searchTimeout = null;
 
-        // ═══ Download Flow: Get Info → Show Info → Download → Show File ═══
+        // ═══ Download Flow: AI Parse → Get Info → Download → Show File ═══
         let _currentDocId = null;
+        let _lastError = null;
+        let _lastUrl = null;
 
         async function startDownload() {
-            const url = document.getElementById('urlInput').value.trim();
+            let url = document.getElementById('urlInput').value.trim();
             if (!url) return;
-            if (!url.includes('scribd.com')) {
-                showStatus('error', '❌ Vui lòng nhập link Scribd hợp lệ');
-                return;
-            }
+
             const btn = document.getElementById('downloadBtn');
             btn.disabled = true;
+            btn.textContent = '🤖 AI đang phân tích...';
+            showStatus('downloading', '<span class="spinner"></span> 🤖 AI đang phân tích link...');
+
+            // ── Step 0: AI Smart Parse ──
+            try {
+                const parseRes = await fetch('/api/ai/parse', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({text: url})
+                });
+                const parsed = await parseRes.json();
+
+                if (parsed.type === 'search_query' || (!parsed.fixed_url && parsed.confidence < 0.5)) {
+                    let html = '<div class="ai-diagnosis"><div class="ai-header">🤖 <b>AI Analysis</b></div>';
+                    html += '<div class="ai-body">';
+                    (parsed.suggestions || []).forEach(s => html += `<div class="ai-suggestion">${s}</div>`);
+                    html += '</div></div>';
+                    showStatus('error', html);
+                    resetBtn(); return;
+                }
+
+                if (parsed.fixed_url && parsed.fixed_url !== url) {
+                    url = parsed.fixed_url;
+                    document.getElementById('urlInput').value = url;
+                    const fixes = (parsed.issues || []).join(', ');
+                    if (fixes) {
+                        showStatus('downloading', `<span class="spinner"></span> 🤖 AI đã sửa link: <em>${fixes}</em><br>Bước 1/3 — Đang lấy thông tin...`);
+                    }
+                } else {
+                    showStatus('downloading', '<span class="spinner"></span> Bước 1/3 — Đang lấy thông tin tài liệu...');
+                }
+            } catch(e) {
+                // AI parse failed — continue with original URL
+            }
+
+            _lastUrl = url;
             btn.textContent = '⏳ Đang lấy thông tin...';
-            showStatus('downloading', '<span class="spinner"></span> Bước 1/3 — Đang lấy thông tin tài liệu...');
 
             try {
                 // === Step 1: Get document info ===
@@ -846,19 +1005,95 @@ def get_html() -> str:
                     } else if (data.status === 'failed') {
                         clearInterval(pollInterval); pollInterval = null;
                         clearInterval(animProgress);
-                        showStatus('error', `
-                            <div class="file-info-card">
-                                <div class="file-icon">❌</div>
-                                <div class="file-details">
-                                    <div class="file-title">${title || 'Tài liệu'}</div>
-                                    <div class="file-meta">${data.error || 'Tải thất bại'}</div>
-                                </div>
-                            </div>
-                        `);
+                        _lastError = data.error || 'Tải thất bại';
+                        // AI Diagnosis
+                        showAIDiagnosis(docId, _lastError, _lastUrl, title);
                         resetBtn(); loadHistory();
                     }
                 } catch(e) {}
             }, 3000);
+        }
+
+        async function showAIDiagnosis(docId, errorMsg, url, title) {
+            try {
+                const res = await fetch('/api/ai/diagnose', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({doc_id: docId, error: errorMsg, url: url || ''})
+                });
+                const data = await res.json();
+                const d = data.diagnosis;
+                let html = `
+                    <div class="file-info-card">
+                        <div class="file-icon">❌</div>
+                        <div class="file-details">
+                            <div class="file-title">${title || 'Tải thất bại'}</div>
+                            <div class="file-meta">${d.error_type}</div>
+                        </div>
+                    </div>
+                    <div class="ai-diagnosis">
+                        <div class="ai-header">🤖 <b>AI Chẩn đoán</b> <span class="badge badge-${d.severity === 'low' ? 'completed' : d.severity === 'high' ? 'failed' : 'downloading'}">${d.severity}</span></div>
+                        <div class="ai-body">
+                            <p>${d.diagnosis}</p>
+                `;
+                d.suggestions.forEach(s => {
+                    html += `<div class="ai-suggestion">${s}</div>`;
+                });
+                if (d.can_retry) {
+                    html += `<button class="btn-primary ai-retry-btn" onclick="aiRetry('${docId}')">🤖 AI Thử lại thông minh</button>`;
+                }
+                html += '</div></div>';
+                showStatus('error', html);
+            } catch(e) {
+                showStatus('error', `
+                    <div class="file-info-card">
+                        <div class="file-icon">❌</div>
+                        <div class="file-details">
+                            <div class="file-title">${title || 'Tải thất bại'}</div>
+                            <div class="file-meta">${errorMsg}</div>
+                        </div>
+                    </div>
+                    <button class="btn-primary ai-retry-btn" onclick="startDownload()">🔄 Thử lại</button>
+                `);
+            }
+        }
+
+        async function aiRetry(docId) {
+            showStatus('downloading', '<span class="spinner"></span> 🤖 AI đang thử lại với phương pháp khác...');
+            const btn = document.getElementById('downloadBtn');
+            btn.disabled = true;
+            btn.textContent = '🤖 AI đang retry...';
+            try {
+                const res = await fetch('/api/ai/retry', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({doc_id: docId, error: _lastError || '', url: _lastUrl || ''})
+                });
+                const data = await res.json();
+                if (data.success && data.status === 'retrying') {
+                    const actionText = data.action_taken ? data.action_taken.replace(/_/g, ' ') : 'retry';
+                    showStatus('downloading', `
+                        <div class="ai-diagnosis">
+                            <div class="ai-header">🤖 <b>AI Retry</b></div>
+                            <div class="ai-body">
+                                <p>Hành động: <b>${actionText}</b></p>
+                                <p>${data.diagnosis.diagnosis}</p>
+                            </div>
+                        </div>
+                        <div class="progress-section">
+                            <span class="spinner"></span> Đang tải lại...
+                            <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+                        </div>
+                    `);
+                    startPolling(data.doc_id, '', 0);
+                } else {
+                    showStatus('error', '❌ AI retry thất bại: ' + (data.error || 'Unknown'));
+                    resetBtn();
+                }
+            } catch(e) {
+                showStatus('error', '❌ Lỗi kết nối AI retry');
+                resetBtn();
+            }
         }
 
         function resetBtn() {

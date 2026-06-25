@@ -769,6 +769,13 @@ a:hover { text-decoration: underline; }
 }
 .dl-btn:hover { background: #5a4bd1; transform: translateY(-1px); text-decoration: none; }
 
+/* AI Diagnosis box */
+.ai-box {
+    text-align: left; margin-top: 10px;
+    background: rgba(108,92,231,0.06); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 14px; line-height: 1.6;
+}
+
 /* Spinner */
 .spinner {
     display: inline-block; width: 18px; height: 18px;
@@ -990,6 +997,27 @@ async function startDownload() {
     btnText.textContent = 'Đang lấy thông tin...';
     spinner.classList.remove('hidden');
 
+    // === Step 0: AI Smart Parse ===
+    try {
+        const parseRes = await fetch(API + '/api/ai/parse', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({text: url})
+        });
+        const parsed = await parseRes.json();
+        if (parsed.type === 'search_query' || (!parsed.fixed_url && parsed.confidence < 0.5)) {
+            let html = '<div class="ai-box"><b>🤖 AI:</b> ';
+            (parsed.suggestions || []).forEach(s => html += `<p>${s}</p>`);
+            html += '</div>';
+            showStatus('error', html);
+            resetBtn(); return;
+        }
+        if (parsed.fixed_url && parsed.fixed_url !== url) {
+            url = parsed.fixed_url;
+            input.value = url;
+        }
+    } catch(e) { /* continue */ }
+
     // === Step 1: Get document info ===
     showStatus('downloading', '<div class="step-indicator"><span class="step-badge active">1</span> Lấy thông tin <span class="step-badge">2</span> Tải file <span class="step-badge">3</span> Hoàn tất</div><div class="step-msg"><span class="spinner-sm"></span> Đang lấy thông tin tài liệu...</div>');
 
@@ -1112,11 +1140,32 @@ async function pollStatus(docId, title, pages) {
                 resetBtn();
             } else if (data.status === 'failed') {
                 clearInterval(interval); clearInterval(animInt);
-                showStatus('error', '❌ ' + (data.error || 'Tải thất bại'));
+                showAIDiagnosis(docId, data.error || 'Tải thất bại');
                 resetBtn();
             }
         } catch (e) { /* retry */ }
     }, 3000);
+}
+
+async function showAIDiagnosis(docId, errorMsg) {
+    try {
+        const res = await fetch(API + '/api/ai/diagnose', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({doc_id: docId, error: errorMsg, url: ''})
+        });
+        const data = await res.json();
+        const d = data.diagnosis;
+        let html = `<div class="ai-box"><b>🤖 AI Chẩn đoán:</b> ${d.diagnosis}`;
+        d.suggestions.forEach(s => { html += `<p style="margin:4px 0;font-size:0.9rem">${s}</p>`; });
+        if (d.can_retry) {
+            html += `<button class="cta-btn" style="margin-top:10px;font-size:0.9rem;padding:10px 20px" onclick="location.reload()">🔄 Thử lại</button>`;
+        }
+        html += '</div>';
+        showStatus('error', html);
+    } catch(e) {
+        showStatus('error', '❌ ' + errorMsg);
+    }
 }
 
 function showStatus(type, html) {
