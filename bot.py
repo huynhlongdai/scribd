@@ -34,6 +34,7 @@ import database as db
 import account_manager as acct_mgr
 import ai_helper
 import scheduler
+import search
 
 # Configuration
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -94,6 +95,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/accounts \\- Danh sách tài khoản\n"
         "/addaccount \\- Thêm tài khoản Scribd\n"
         "/removeaccount \\- Xóa tài khoản\n"
+        "/search \\- Tìm kiếm tài liệu\n"
         "/batch \\- Tải hàng loạt\n"
         "/schedules \\- Xem lịch tải\n"
         "/help \\- Trợ giúp"
@@ -317,6 +319,37 @@ async def batch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             logger.warning(f"Failed to send file: {e}")
 
 
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search Scribd: /search keyword"""
+    query = " ".join(context.args or [])
+    if not query:
+        await update.message.reply_text("🔍 Cách dùng: `/search từ khóa`", parse_mode="Markdown")
+        return
+
+    msg = await update.message.reply_text(f"🔍 Đang tìm kiếm \"{query}\"...")
+
+    try:
+        result = await search.search_scribd(query)
+        if not result["results"]:
+            await msg.edit_text(f"📭 Không tìm thấy tài liệu cho \"{query}\"")
+            return
+
+        lines = [f"🔍 *Kết quả cho \"{query}\":*\n"]
+        for i, r in enumerate(result["results"][:10], 1):
+            title = r["title"][:60]
+            lines.append(f"{i}. [{title}]({r['url']})")
+            if r.get("author"):
+                lines[-1] += f" — _{r['author']}_"
+
+        lines.append(f"\n📄 Tìm thấy {result['total']} tài liệu")
+        lines.append("💡 Gửi link để tải hoặc dùng /batch để tải nhiều")
+
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"Search command failed: {e}")
+        await msg.edit_text(f"❌ Lỗi tìm kiếm: {str(e)[:100]}")
+
+
 async def schedules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all schedules: /schedules"""
     schedules = scheduler.get_all_schedules(limit=10)
@@ -519,6 +552,7 @@ def main():
     app.add_handler(CommandHandler("accounts", accounts_command))
     app.add_handler(CommandHandler("addaccount", addaccount_command))
     app.add_handler(CommandHandler("removeaccount", removeaccount_command))
+    app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("batch", batch_command))
     app.add_handler(CommandHandler("schedules", schedules_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

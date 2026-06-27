@@ -20,6 +20,7 @@ import account_manager as acct_mgr
 import ai_helper
 import scheduler
 import gdrive
+import search
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -427,6 +428,32 @@ async def toggle_account(account_id: int):
     else:
         db.enable_account(account_id)
         return {"success": True, "new_status": "active"}
+
+
+# ═══════════════════════════════════════════
+# Search & Category API
+# ═══════════════════════════════════════════
+
+@app.get("/api/search")
+async def search_endpoint(q: str = "", page: int = 1):
+    """Search Scribd by keyword."""
+    if not q.strip():
+        return {"results": [], "total": 0, "query": "", "page": 1}
+    result = await search.search_scribd(q.strip(), page=page)
+    return result
+
+
+@app.get("/api/categories")
+async def list_categories():
+    """List all available Scribd categories."""
+    return search.get_categories()
+
+
+@app.get("/api/categories/{category_key}")
+async def browse_category_endpoint(category_key: str, page: int = 1):
+    """Browse documents in a category."""
+    result = await search.browse_category(category_key, page=page)
+    return result
 
 
 # ═══════════════════════════════════════════
@@ -933,7 +960,9 @@ def get_html() -> str:
             <button class="tab" data-tab="queue" onclick="switchTab('queue')">🔄 Hàng đợi</button>
             <button class="tab" data-tab="accounts" onclick="switchTab('accounts')">👤 Tài khoản</button>
             <button class="tab" data-tab="stats" onclick="switchTab('stats')">📊 Thống kê</button>
+            <button class="tab" data-tab="search" onclick="switchTab('search')">🔍 Tìm kiếm</button>
             <button class="tab" data-tab="scheduler" onclick="switchTab('scheduler')">📅 Lịch tải</button>
+            <button class="tab" data-tab="monitor" onclick="switchTab('monitor')">📊 Giám sát</button>
             <button class="tab" data-tab="gdrive" onclick="switchTab('gdrive')">☁️ GDrive</button>
         </div>
 
@@ -982,6 +1011,42 @@ def get_html() -> str:
             <div class="stats-grid" id="statsGrid"></div>
         </div>
 
+        <!-- Search Tab -->
+        <div id="tab-search" style="display:none">
+            <div class="panel" style="margin-bottom:16px">
+                <div style="display:flex;gap:10px;margin-bottom:12px">
+                    <input type="text" class="input-field" id="searchKeyword" placeholder="🔍 Tìm kiếm tài liệu trên Scribd..." style="flex:1" onkeydown="if(event.key==='Enter')searchScribd()">
+                    <button class="btn-primary" onclick="searchScribd()">🔍 Tìm</button>
+                </div>
+                <div style="display:flex;flex-wrap:wrap;gap:6px" id="categoryChips"></div>
+            </div>
+            <div id="searchResults">
+                <div class="empty-state"><div class="icon">🔍</div><p>Tìm kiếm tài liệu hoặc chọn danh mục</p></div>
+            </div>
+            <div id="searchActions" style="display:none;margin-top:12px;text-align:center">
+                <button class="btn-primary" onclick="addSelectedToSchedule()" id="addToSchedBtn" style="margin-right:8px">📅 Thêm vào lịch tải</button>
+                <button class="btn-primary" onclick="downloadSelected()" style="background:#27ae60">⬇️ Tải ngay</button>
+                <span id="selectedCount" style="color:var(--text2);margin-left:12px;font-size:0.9rem"></span>
+            </div>
+        </div>
+
+        <!-- Monitor Tab -->
+        <div id="tab-monitor" style="display:none">
+            <div class="stats-grid" id="monitorStats" style="margin-bottom:16px"></div>
+            <div class="panel" style="margin-bottom:16px">
+                <h3 style="margin:0 0 12px">🔄 Đang tải</h3>
+                <div id="activeDownloads">
+                    <div class="empty-state"><div class="icon">✅</div><p>Không có tải nào đang chạy</p></div>
+                </div>
+            </div>
+            <div class="panel">
+                <h3 style="margin:0 0 12px">📅 Lịch tải đang chạy</h3>
+                <div id="activeSchedules">
+                    <div class="empty-state"><div class="icon">📅</div><p>Không có lịch tải đang chạy</p></div>
+                </div>
+            </div>
+        </div>
+
         <!-- Scheduler Tab -->
         <div id="tab-scheduler" style="display:none">
             <div class="panel" style="margin-bottom:16px">
@@ -995,9 +1060,25 @@ def get_html() -> str:
                         <option value="recurring">🔄 Lặp lại</option>
                     </select>
                     <input type="datetime-local" id="schedTime" class="input-field" style="width:auto;display:none">
-                    <input type="number" id="schedRepeat" class="input-field" placeholder="Mỗi N giờ" min="1" value="24" style="width:100px;display:none">
+                    <div id="schedRecurringOpts" style="display:none;display:none;gap:8px;align-items:center">
+                        <select id="schedRepeatPreset" class="input-field" style="width:auto" onchange="applyRepeatPreset()">
+                            <option value="1">Mỗi giờ</option>
+                            <option value="6">Mỗi 6 giờ</option>
+                            <option value="12">Mỗi 12 giờ</option>
+                            <option value="24" selected>Hàng ngày</option>
+                            <option value="168">Hàng tuần</option>
+                            <option value="custom">Tùy chỉnh...</option>
+                        </select>
+                        <input type="number" id="schedRepeat" class="input-field" placeholder="Giờ" min="1" value="24" style="width:80px;display:none">
+                    </div>
+                    <select id="schedConcurrent" class="input-field" style="width:auto;min-width:100px" title="Số file tải đồng thời">
+                        <option value="1">1 file/lần</option>
+                        <option value="2" selected>2 file/lần</option>
+                        <option value="3">3 file/lần</option>
+                        <option value="5">5 file/lần</option>
+                    </select>
                     <label style="display:flex;align-items:center;gap:6px;color:var(--text2);font-size:0.9rem;cursor:pointer">
-                        <input type="checkbox" id="schedGdrive"> ☁️ Lưu Google Drive
+                        <input type="checkbox" id="schedGdrive"> ☁️ GDrive
                     </label>
                 </div>
                 <button class="btn-primary" onclick="createSchedule()">📅 Tạo lịch tải</button>
@@ -1497,7 +1578,7 @@ def get_html() -> str:
         function switchTab(tab) {
             currentTab = tab;
             document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
-            ['history','queue','accounts','stats','scheduler','gdrive'].forEach(t => {
+            ['history','queue','accounts','stats','search','scheduler','monitor','gdrive'].forEach(t => {
                 const el = document.getElementById('tab-' + t);
                 if (el) el.style.display = t === tab ? '' : 'none';
             });
@@ -1505,15 +1586,27 @@ def get_html() -> str:
             if (tab === 'queue') loadQueue();
             if (tab === 'accounts') loadAccounts();
             if (tab === 'stats') loadStats();
+            if (tab === 'search') loadCategories();
             if (tab === 'scheduler') loadSchedules();
+            if (tab === 'monitor') { loadMonitor(); startMonitorPolling(); }
             if (tab === 'gdrive') loadGDrive();
+            if (tab !== 'monitor') stopMonitorPolling();
         }
 
         // ═══ Scheduler Functions ═══
         function toggleSchedTime() {
             const type = document.getElementById('schedType').value;
             document.getElementById('schedTime').style.display = type === 'once' ? '' : 'none';
-            document.getElementById('schedRepeat').style.display = type === 'recurring' ? '' : 'none';
+            document.getElementById('schedRecurringOpts').style.display = type === 'recurring' ? 'flex' : 'none';
+        }
+        function applyRepeatPreset() {
+            const val = document.getElementById('schedRepeatPreset').value;
+            if (val === 'custom') {
+                document.getElementById('schedRepeat').style.display = '';
+            } else {
+                document.getElementById('schedRepeat').style.display = 'none';
+                document.getElementById('schedRepeat').value = val;
+            }
         }
 
         async function createSchedule() {
@@ -1529,9 +1622,13 @@ def get_html() -> str:
             const body = {
                 name, urls, schedule_type: type,
                 upload_gdrive: document.getElementById('schedGdrive').checked,
+                max_concurrent: parseInt(document.getElementById('schedConcurrent').value) || 2,
             };
             if (type === 'once') body.scheduled_at = document.getElementById('schedTime').value;
-            if (type === 'recurring') body.repeat_hours = parseInt(document.getElementById('schedRepeat').value) || 24;
+            if (type === 'recurring') {
+                const preset = document.getElementById('schedRepeatPreset').value;
+                body.repeat_hours = preset === 'custom' ? (parseInt(document.getElementById('schedRepeat').value) || 24) : parseInt(preset);
+            }
 
             try {
                 const res = await fetch('/api/schedules', {
@@ -1765,6 +1862,222 @@ def get_html() -> str:
                         </div>
                     </div>`).join('');
             } catch(e) { console.error(e); }
+        }
+
+        // ═══ Search Functions ═══
+        let searchSelectedDocs = new Set();
+
+        async function loadCategories() {
+            try {
+                const res = await fetch('/api/categories');
+                const cats = await res.json();
+                const el = document.getElementById('categoryChips');
+                el.innerHTML = cats.map(c =>
+                    `<button onclick="browseCategory('${c.key}')" style="background:var(--bg2);border:1px solid var(--border);color:var(--text1);padding:6px 12px;border-radius:20px;cursor:pointer;font-size:0.85rem;transition:all 0.2s" onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--border)'">${c.icon} ${c.name}</button>`
+                ).join('');
+            } catch(e) { console.error(e); }
+        }
+
+        async function searchScribd() {
+            const kw = document.getElementById('searchKeyword').value.trim();
+            if (!kw) return;
+            document.getElementById('searchResults').innerHTML = '<div class="empty-state"><div class="icon" style="animation:pulse 1.5s infinite">🔍</div><p>Đang tìm kiếm "' + kw + '"...</p></div>';
+            searchSelectedDocs.clear();
+            updateSearchActions();
+            try {
+                const res = await fetch('/api/search?q=' + encodeURIComponent(kw));
+                const data = await res.json();
+                renderSearchResults(data.results, 'Kết quả cho "' + kw + '"', data.total);
+            } catch(e) {
+                document.getElementById('searchResults').innerHTML = '<div class="empty-state"><div class="icon">❌</div><p>Lỗi tìm kiếm</p></div>';
+            }
+        }
+
+        async function browseCategory(key) {
+            document.getElementById('searchResults').innerHTML = '<div class="empty-state"><div class="icon" style="animation:pulse 1.5s infinite">📂</div><p>Đang tải danh mục...</p></div>';
+            searchSelectedDocs.clear();
+            updateSearchActions();
+            try {
+                const res = await fetch('/api/categories/' + key);
+                const data = await res.json();
+                renderSearchResults(data.results, data.category_icon + ' ' + data.category_name, data.total);
+            } catch(e) {
+                document.getElementById('searchResults').innerHTML = '<div class="empty-state"><div class="icon">❌</div><p>Lỗi tải danh mục</p></div>';
+            }
+        }
+
+        function renderSearchResults(results, title, total) {
+            const el = document.getElementById('searchResults');
+            if (!results || !results.length) {
+                el.innerHTML = '<div class="empty-state"><div class="icon">📭</div><p>Không tìm thấy tài liệu</p></div>';
+                return;
+            }
+            let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <h3 style="margin:0;color:var(--text1)">${title}</h3>
+                <label style="color:var(--text2);font-size:0.85rem;cursor:pointer">
+                    <input type="checkbox" onchange="toggleSelectAll(this.checked)"> Chọn tất cả
+                </label>
+            </div>`;
+            html += results.map(r => `
+                <div class="history-item" style="cursor:pointer" onclick="toggleSearchSelect('${r.doc_id}', '${r.url}', this)">
+                    <input type="checkbox" class="search-cb" data-id="${r.doc_id}" style="margin-right:10px;cursor:pointer" onclick="event.stopPropagation();toggleSearchSelect('${r.doc_id}', '${r.url}')">
+                    <div class="history-icon">📄</div>
+                    <div class="history-details" style="flex:1">
+                        <div class="history-title">${r.title}</div>
+                        <div class="history-meta">
+                            ${r.author ? '✍️ ' + r.author + ' · ' : ''}
+                            ${r.pages ? r.pages + ' trang · ' : ''}
+                            ID: ${r.doc_id}
+                        </div>
+                        ${r.description ? '<div style="color:var(--text2);font-size:0.8rem;margin-top:2px">' + r.description.substring(0,120) + '...</div>' : ''}
+                    </div>
+                    <a href="${r.url}" target="_blank" onclick="event.stopPropagation()" style="color:var(--accent);font-size:0.85rem;text-decoration:none;padding:4px 8px">🔗</a>
+                </div>`).join('');
+            el.innerHTML = html;
+        }
+
+        function toggleSearchSelect(docId, url, rowEl) {
+            const key = docId + '|' + url;
+            const cb = document.querySelector(`.search-cb[data-id="${docId}"]`);
+            if (searchSelectedDocs.has(key)) {
+                searchSelectedDocs.delete(key);
+                if (cb) cb.checked = false;
+            } else {
+                searchSelectedDocs.add(key);
+                if (cb) cb.checked = true;
+            }
+            updateSearchActions();
+        }
+        function toggleSelectAll(checked) {
+            document.querySelectorAll('.search-cb').forEach(cb => {
+                const id = cb.dataset.id;
+                const row = cb.closest('.history-item');
+                const link = row ? row.querySelector('a[href*="scribd"]') : null;
+                const url = link ? link.href : 'https://www.scribd.com/document/' + id;
+                const key = id + '|' + url;
+                if (checked) { searchSelectedDocs.add(key); cb.checked = true; }
+                else { searchSelectedDocs.delete(key); cb.checked = false; }
+            });
+            updateSearchActions();
+        }
+        function updateSearchActions() {
+            const n = searchSelectedDocs.size;
+            document.getElementById('searchActions').style.display = n > 0 ? '' : 'none';
+            document.getElementById('selectedCount').textContent = n > 0 ? `${n} tài liệu đã chọn` : '';
+        }
+
+        async function addSelectedToSchedule() {
+            const urls = [...searchSelectedDocs].map(s => s.split('|')[1]);
+            if (!urls.length) return;
+            const name = prompt('Tên lịch tải:', 'Tìm kiếm Scribd ' + new Date().toLocaleDateString('vi-VN'));
+            if (!name) return;
+            try {
+                const res = await fetch('/api/schedules', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name, urls, schedule_type: 'now', upload_gdrive: false})
+                });
+                const data = await res.json();
+                if (data.id) {
+                    alert('✅ Đã tạo lịch tải "' + name + '" với ' + urls.length + ' files! Chuyển sang tab Lịch tải để xem.');
+                    searchSelectedDocs.clear();
+                    updateSearchActions();
+                    switchTab('scheduler');
+                }
+            } catch(e) { alert('Lỗi tạo lịch tải'); }
+        }
+
+        async function downloadSelected() {
+            const urls = [...searchSelectedDocs].map(s => s.split('|')[1]);
+            if (!urls.length) return;
+            const name = 'Tải nhanh ' + new Date().toLocaleString('vi-VN');
+            try {
+                const res = await fetch('/api/schedules', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name, urls, schedule_type: 'now', upload_gdrive: false})
+                });
+                const data = await res.json();
+                if (data.id) {
+                    alert('⚡ Đang tải ' + urls.length + ' files! Chuyển sang tab Giám sát để theo dõi.');
+                    searchSelectedDocs.clear();
+                    updateSearchActions();
+                    switchTab('monitor');
+                }
+            } catch(e) { alert('Lỗi tải'); }
+        }
+
+        // ═══ Monitor Functions ═══
+        let monitorInterval = null;
+
+        async function loadMonitor() {
+            try {
+                // Load overall stats
+                const [statsRes, queueRes, schedsRes] = await Promise.all([
+                    fetch('/api/stats'), fetch('/api/queue'), fetch('/api/schedules')
+                ]);
+                const stats = await statsRes.json();
+                const queue = await queueRes.json();
+                const scheds = await schedsRes.json();
+
+                const activeScheds = scheds.filter(s => s.status === 'running');
+                const pendingScheds = scheds.filter(s => s.status === 'pending');
+
+                // Stats cards
+                document.getElementById('monitorStats').innerHTML = `
+                    <div class="stat-card"><div class="stat-value">${queue.length}</div><div class="stat-label">Đang tải</div></div>
+                    <div class="stat-card"><div class="stat-value">${activeScheds.length}</div><div class="stat-label">Lịch đang chạy</div></div>
+                    <div class="stat-card"><div class="stat-value">${pendingScheds.length}</div><div class="stat-label">Lịch chờ</div></div>
+                    <div class="stat-card"><div class="stat-value">${stats.total_downloads || 0}</div><div class="stat-label">Tổng đã tải</div></div>
+                `;
+
+                // Active downloads
+                const adEl = document.getElementById('activeDownloads');
+                if (queue.length === 0) {
+                    adEl.innerHTML = '<div style="text-align:center;padding:16px;color:var(--text2)">✅ Không có tải nào đang chạy</div>';
+                } else {
+                    adEl.innerHTML = queue.map(q => {
+                        const elapsed = q.started_at ? Math.round((Date.now()/1000 - new Date(q.started_at).getTime()/1000)) : 0;
+                        return `<div class="history-item">
+                            <div class="history-icon" style="animation:pulse 1.5s infinite">🔄</div>
+                            <div class="history-details">
+                                <div class="history-title">${q.title || q.doc_id}</div>
+                                <div class="history-meta">ID: ${q.doc_id} · ${q.status} · ${elapsed}s</div>
+                            </div>
+                        </div>`;
+                    }).join('');
+                }
+
+                // Active schedules
+                const asEl = document.getElementById('activeSchedules');
+                const runScheds = scheds.filter(s => s.status === 'running' || s.status === 'pending');
+                if (runScheds.length === 0) {
+                    asEl.innerHTML = '<div style="text-align:center;padding:16px;color:var(--text2)">📅 Không có lịch tải đang chạy</div>';
+                } else {
+                    asEl.innerHTML = runScheds.map(s => {
+                        const progress = s.total_items > 0 ? Math.round((s.completed_items / s.total_items) * 100) : 0;
+                        const icons = {pending:'⏳',running:'🔄'};
+                        return `<div class="panel" style="margin-bottom:8px">
+                            <div style="display:flex;justify-content:space-between;align-items:center">
+                                <div>
+                                    <b>${icons[s.status]||'📅'} ${s.name}</b>
+                                    <div style="font-size:0.85rem;color:var(--text2);margin-top:4px">
+                                        📄 ${s.total_items} files · ✅ ${s.completed_items} · ❌ ${s.failed_items} · ⏳ ${s.total_items - s.completed_items - s.failed_items} còn lại
+                                    </div>
+                                </div>
+                                <div style="font-size:1.2rem;font-weight:bold;color:var(--accent)">${progress}%</div>
+                            </div>
+                            <div class="progress-bar" style="margin-top:8px"><div class="progress-fill" style="width:${progress}%;transition:width 0.5s"></div></div>
+                        </div>`;
+                    }).join('');
+                }
+            } catch(e) { console.error('Monitor error:', e); }
+        }
+
+        function startMonitorPolling() {
+            stopMonitorPolling();
+            monitorInterval = setInterval(loadMonitor, 5000);
+        }
+        function stopMonitorPolling() {
+            if (monitorInterval) { clearInterval(monitorInterval); monitorInterval = null; }
         }
 
         // ═══ Init ═══
