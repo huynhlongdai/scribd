@@ -18,11 +18,13 @@ from downloader import download_scribd_document, get_document_info, extract_doc_
 import database as db
 import account_manager as acct_mgr
 import ai_helper
+import scheduler
+import gdrive
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Scribd Downloader", version="3.0.0")
+app = FastAPI(title="Scribd Downloader", version="4.0.0")
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/tmp/scribd_downloads")
 COOKIES_PATH = os.environ.get("COOKIES_PATH", "")
@@ -428,6 +430,155 @@ async def toggle_account(account_id: int):
 
 
 # ═══════════════════════════════════════════
+# Scheduler API
+# ═══════════════════════════════════════════
+
+@app.get("/api/schedules")
+async def list_schedules():
+    return scheduler.get_all_schedules()
+
+
+@app.get("/api/schedules/{schedule_id}")
+async def get_schedule_detail(schedule_id: int):
+    s = scheduler.get_schedule(schedule_id)
+    if not s:
+        raise HTTPException(404, "Lịch tải không tìm thấy")
+    return s
+
+
+@app.post("/api/schedules")
+async def create_schedule_endpoint(request: Request, background_tasks: BackgroundTasks):
+    data = await request.json()
+    name = data.get("name", "").strip()
+    urls = data.get("urls", [])
+    if not name or not urls:
+        raise HTTPException(400, "Thiếu tên hoặc danh sách link")
+
+    result = scheduler.create_schedule(
+        name=name,
+        urls=urls,
+        schedule_type=data.get("schedule_type", "now"),
+        scheduled_at=data.get("scheduled_at"),
+        repeat_hours=int(data.get("repeat_hours", 0)),
+        upload_gdrive=data.get("upload_gdrive", False),
+        gdrive_folder=data.get("gdrive_folder", "Scribd Downloads"),
+        max_concurrent=int(data.get("max_concurrent", MAX_CONCURRENT)),
+    )
+
+    # If type is 'now', start immediately
+    if data.get("schedule_type") == "now":
+        background_tasks.add_task(scheduler.run_schedule, result["id"])
+
+    return result
+
+
+@app.post("/api/schedules/{schedule_id}/run")
+async def run_schedule_endpoint(schedule_id: int, background_tasks: BackgroundTasks):
+    s = scheduler.get_schedule(schedule_id)
+    if not s:
+        raise HTTPException(404, "Lịch tải không tìm thấy")
+    background_tasks.add_task(scheduler.run_schedule, schedule_id)
+    return {"success": True, "message": "Đã bắt đầu chạy"}
+
+
+@app.post("/api/schedules/{schedule_id}/pause")
+async def pause_schedule_endpoint(schedule_id: int):
+    scheduler.pause_schedule(schedule_id)
+    return {"success": True}
+
+
+@app.post("/api/schedules/{schedule_id}/resume")
+async def resume_schedule_endpoint(schedule_id: int, background_tasks: BackgroundTasks):
+    scheduler.resume_schedule(schedule_id)
+    background_tasks.add_task(scheduler.run_schedule, schedule_id)
+    return {"success": True}
+
+
+@app.delete("/api/schedules/{schedule_id}")
+async def delete_schedule_endpoint(schedule_id: int):
+    scheduler.delete_schedule(schedule_id)
+    return {"success": True}
+
+
+@app.post("/api/schedules/{schedule_id}/urls")
+async def add_urls_endpoint(schedule_id: int, request: Request):
+    data = await request.json()
+    urls = data.get("urls", [])
+    if not urls:
+        raise HTTPException(400, "Thiếu danh sách link")
+    count = scheduler.add_urls_to_schedule(schedule_id, urls)
+    return {"success": True, "added": count}
+
+
+# ═══════════════════════════════════════════
+# Google Drive API
+# ═══════════════════════════════════════════
+
+@app.get("/api/gdrive/status")
+async def gdrive_status():
+    return gdrive.get_status()
+
+
+@app.get("/api/gdrive/auth-url")
+async def gdrive_auth_url():
+    url = gdrive.get_auth_url()
+    if not url:
+        raise HTTPException(400, "Credentials chưa được cấu hình")
+    return {"url": url}
+
+
+@app.post("/api/gdrive/credentials")
+async def save_gdrive_credentials(request: Request):
+    data = await request.json()
+    creds_text = data.get("credentials", "")
+    try:
+        creds_json = json.loads(creds_text)
+        with open(gdrive.CREDENTIALS_PATH, "w") as f:
+            json.dump(creds_json, f)
+        return {"success": True, "message": "Đã lưu credentials. Bước tiếp: xác thực Google."}
+    except json.JSONDecodeError:
+        raise HTTPException(400, "JSON không hợp lệ")
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/gdrive/authorize")
+async def authorize_gdrive(request: Request):
+    data = await request.json()
+    code = data.get("code", "").strip()
+    if not code:
+        raise HTTPException(400, "Thiếu mã xác thực")
+    result = gdrive.authorize_with_code(code)
+    return result
+
+
+@app.post("/api/gdrive/disconnect")
+async def disconnect_gdrive():
+    gdrive.disconnect()
+    return {"success": True, "message": "Đã ngắt kết nối Google Drive"}
+
+
+@app.get("/api/gdrive/files")
+async def list_gdrive_files():
+    try:
+        files = gdrive.list_uploaded_files()
+        return files
+    except Exception as e:
+        return []
+
+
+# ═══════════════════════════════════════════
+# Startup
+# ═══════════════════════════════════════════
+
+@app.on_event("startup")
+async def startup_event():
+    """Start the scheduler on app startup."""
+    scheduler.start_scheduler()
+    logger.info("📅 Scheduler started with web server")
+
+
+# ═══════════════════════════════════════════
 # Background Download Worker
 # ═══════════════════════════════════════════
 
@@ -782,6 +933,8 @@ def get_html() -> str:
             <button class="tab" data-tab="queue" onclick="switchTab('queue')">🔄 Hàng đợi</button>
             <button class="tab" data-tab="accounts" onclick="switchTab('accounts')">👤 Tài khoản</button>
             <button class="tab" data-tab="stats" onclick="switchTab('stats')">📊 Thống kê</button>
+            <button class="tab" data-tab="scheduler" onclick="switchTab('scheduler')">📅 Lịch tải</button>
+            <button class="tab" data-tab="gdrive" onclick="switchTab('gdrive')">☁️ GDrive</button>
         </div>
 
         <!-- History Tab -->
@@ -827,6 +980,42 @@ def get_html() -> str:
         <!-- Stats Tab -->
         <div id="tab-stats" style="display:none">
             <div class="stats-grid" id="statsGrid"></div>
+        </div>
+
+        <!-- Scheduler Tab -->
+        <div id="tab-scheduler" style="display:none">
+            <div class="panel" style="margin-bottom:16px">
+                <h3 style="margin:0 0 12px">📅 Tạo lịch tải mới</h3>
+                <input type="text" class="input-field" id="schedName" placeholder="Tên lịch tải (VD: Tài liệu học tập)..." style="margin-bottom:8px">
+                <textarea class="input-field" id="schedUrls" rows="5" placeholder="Dán danh sách link Scribd (mỗi dòng 1 link)..." style="margin-bottom:8px;resize:vertical;font-family:inherit"></textarea>
+                <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+                    <select id="schedType" class="input-field" style="width:auto;min-width:140px" onchange="toggleSchedTime()">
+                        <option value="now">⚡ Tải ngay</option>
+                        <option value="once">⏰ Hẹn giờ</option>
+                        <option value="recurring">🔄 Lặp lại</option>
+                    </select>
+                    <input type="datetime-local" id="schedTime" class="input-field" style="width:auto;display:none">
+                    <input type="number" id="schedRepeat" class="input-field" placeholder="Mỗi N giờ" min="1" value="24" style="width:100px;display:none">
+                    <label style="display:flex;align-items:center;gap:6px;color:var(--text2);font-size:0.9rem;cursor:pointer">
+                        <input type="checkbox" id="schedGdrive"> ☁️ Lưu Google Drive
+                    </label>
+                </div>
+                <button class="btn-primary" onclick="createSchedule()">📅 Tạo lịch tải</button>
+            </div>
+            <div id="schedulesList">
+                <div class="empty-state"><div class="icon">📅</div><p>Chưa có lịch tải nào</p></div>
+            </div>
+        </div>
+
+        <!-- Google Drive Tab -->
+        <div id="tab-gdrive" style="display:none">
+            <div class="panel" id="gdriveStatus">
+                <div class="empty-state"><div class="icon">☁️</div><p>Đang tải...</p></div>
+            </div>
+            <div class="panel" id="gdriveFiles" style="margin-top:16px;display:none">
+                <h3 style="margin:0 0 12px">📁 Files trên Google Drive</h3>
+                <div id="gdriveFilesList"></div>
+            </div>
         </div>
     </div>
 
@@ -1308,13 +1497,274 @@ def get_html() -> str:
         function switchTab(tab) {
             currentTab = tab;
             document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
-            ['history','queue','accounts','stats'].forEach(t => {
-                document.getElementById('tab-' + t).style.display = t === tab ? '' : 'none';
+            ['history','queue','accounts','stats','scheduler','gdrive'].forEach(t => {
+                const el = document.getElementById('tab-' + t);
+                if (el) el.style.display = t === tab ? '' : 'none';
             });
             if (tab === 'history') loadHistory();
             if (tab === 'queue') loadQueue();
             if (tab === 'accounts') loadAccounts();
             if (tab === 'stats') loadStats();
+            if (tab === 'scheduler') loadSchedules();
+            if (tab === 'gdrive') loadGDrive();
+        }
+
+        // ═══ Scheduler Functions ═══
+        function toggleSchedTime() {
+            const type = document.getElementById('schedType').value;
+            document.getElementById('schedTime').style.display = type === 'once' ? '' : 'none';
+            document.getElementById('schedRepeat').style.display = type === 'recurring' ? '' : 'none';
+        }
+
+        async function createSchedule() {
+            const name = document.getElementById('schedName').value.trim();
+            const urlsText = document.getElementById('schedUrls').value.trim();
+            if (!name || !urlsText) {
+                alert('Vui lòng nhập tên và danh sách link!'); return;
+            }
+            const urls = urlsText.split('\n').map(u => u.trim()).filter(u => u);
+            if (urls.length === 0) { alert('Không có link hợp lệ!'); return; }
+
+            const type = document.getElementById('schedType').value;
+            const body = {
+                name, urls, schedule_type: type,
+                upload_gdrive: document.getElementById('schedGdrive').checked,
+            };
+            if (type === 'once') body.scheduled_at = document.getElementById('schedTime').value;
+            if (type === 'recurring') body.repeat_hours = parseInt(document.getElementById('schedRepeat').value) || 24;
+
+            try {
+                const res = await fetch('/api/schedules', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+                if (data.id) {
+                    document.getElementById('schedName').value = '';
+                    document.getElementById('schedUrls').value = '';
+                    loadSchedules();
+                } else {
+                    alert('Lỗi: ' + (data.error || 'Unknown'));
+                }
+            } catch(e) { alert('Lỗi kết nối'); }
+        }
+
+        async function loadSchedules() {
+            try {
+                const res = await fetch('/api/schedules');
+                const data = await res.json();
+                const el = document.getElementById('schedulesList');
+                if (!data.length) {
+                    el.innerHTML = '<div class="empty-state"><div class="icon">📅</div><p>Chưa có lịch tải nào</p></div>';
+                    return;
+                }
+                el.innerHTML = data.map(s => {
+                    const statusIcons = {pending:'⏳',running:'🔄',completed:'✅',completed_with_errors:'⚠️',failed:'❌',paused:'⏸'};
+                    const icon = statusIcons[s.status] || '📅';
+                    const progress = s.total_items > 0 ? Math.round((s.completed_items / s.total_items) * 100) : 0;
+                    return `<div class="panel" style="margin-bottom:10px;cursor:pointer" onclick="viewSchedule(${s.id})">
+                        <div style="display:flex;justify-content:space-between;align-items:center">
+                            <div>
+                                <b>${icon} ${s.name}</b>
+                                <div style="font-size:0.85rem;color:var(--text2);margin-top:4px">
+                                    📄 ${s.total_items} files · ✅ ${s.completed_items} · ❌ ${s.failed_items}
+                                    ${s.upload_to_gdrive ? ' · ☁️ GDrive' : ''}
+                                    ${s.schedule_type === 'recurring' ? ' · 🔄 Lặp lại mỗi ' + s.repeat_interval_hours + 'h' : ''}
+                                </div>
+                            </div>
+                            <div style="display:flex;gap:6px">
+                                ${s.status === 'pending' ? `<button class="btn-primary" style="padding:6px 12px;font-size:0.8rem" onclick="event.stopPropagation();runScheduleNow(${s.id})">▶ Chạy</button>` : ''}
+                                ${s.status === 'running' ? `<button class="btn-primary" style="padding:6px 12px;font-size:0.8rem;background:#e67e22" onclick="event.stopPropagation();pauseSchedule(${s.id})">⏸ Tạm dừng</button>` : ''}
+                                ${s.status === 'paused' ? `<button class="btn-primary" style="padding:6px 12px;font-size:0.8rem" onclick="event.stopPropagation();resumeSchedule(${s.id})">▶ Tiếp tục</button>` : ''}
+                                <button class="btn-primary" style="padding:6px 12px;font-size:0.8rem;background:#e74c3c" onclick="event.stopPropagation();deleteSchedule(${s.id})">🗑</button>
+                            </div>
+                        </div>
+                        ${s.total_items > 0 ? `<div class="progress-bar" style="margin-top:8px"><div class="progress-fill" style="width:${progress}%"></div></div>` : ''}
+                    </div>`;
+                }).join('');
+            } catch(e) { console.error(e); }
+        }
+
+        async function viewSchedule(id) {
+            try {
+                const res = await fetch('/api/schedules/' + id);
+                const s = await res.json();
+                if (!s || !s.items) return;
+
+                let html = `<div class="panel" style="margin-bottom:12px">
+                    <h3 style="margin:0 0 8px">📅 ${s.name}</h3>
+                    <p style="color:var(--text2);font-size:0.85rem">
+                        Loại: ${s.schedule_type} · Trạng thái: ${s.status} · 
+                        Tạo: ${new Date(s.created_at).toLocaleString('vi-VN')}
+                        ${s.upload_to_gdrive ? ' · ☁️ Upload GDrive' : ''}
+                    </p>
+                    <div style="margin-top:8px">
+                        <textarea class="input-field" id="addUrlsArea" rows="2" placeholder="Thêm link mới (mỗi dòng 1 link)..." style="resize:vertical;font-family:inherit"></textarea>
+                        <button class="btn-primary" style="margin-top:4px;padding:6px 14px;font-size:0.85rem" onclick="addUrlsToSchedule(${id})">➕ Thêm URLs</button>
+                    </div>
+                </div>`;
+
+                html += s.items.map(item => {
+                    const icons = {pending:'⏳',downloading:'🔄',completed:'✅',failed:'❌'};
+                    const icon = icons[item.status] || '📄';
+                    return `<div class="history-item">
+                        <div class="history-icon">${icon}</div>
+                        <div class="history-details">
+                            <div class="history-title">${item.title || item.url.substring(0, 60) + '...'}</div>
+                            <div class="history-meta">
+                                ${item.pages ? item.pages + ' trang · ' : ''}
+                                ${item.file_size ? (item.file_size/1024/1024).toFixed(1) + 'MB · ' : ''}
+                                ${item.duration_seconds ? item.duration_seconds.toFixed(0) + 's' : ''}
+                                ${item.gdrive_link ? ' · <a href="' + item.gdrive_link + '" target="_blank" style="color:var(--accent)">☁️ GDrive</a>' : ''}
+                                ${item.error_message ? ' · <span style="color:#e74c3c">' + item.error_message.substring(0, 50) + '</span>' : ''}
+                            </div>
+                        </div>
+                    </div>`;
+                }).join('');
+
+                document.getElementById('schedulesList').innerHTML = 
+                    `<button class="btn-primary" style="margin-bottom:12px;padding:6px 14px;font-size:0.85rem" onclick="loadSchedules()">← Quay lại</button>` + html;
+            } catch(e) { console.error(e); }
+        }
+
+        async function runScheduleNow(id) {
+            await fetch('/api/schedules/' + id + '/run', {method: 'POST'});
+            loadSchedules();
+        }
+        async function pauseSchedule(id) {
+            await fetch('/api/schedules/' + id + '/pause', {method: 'POST'});
+            loadSchedules();
+        }
+        async function resumeSchedule(id) {
+            await fetch('/api/schedules/' + id + '/resume', {method: 'POST'});
+            loadSchedules();
+        }
+        async function deleteSchedule(id) {
+            if (!confirm('Xóa lịch tải này?')) return;
+            await fetch('/api/schedules/' + id, {method: 'DELETE'});
+            loadSchedules();
+        }
+        async function addUrlsToSchedule(id) {
+            const text = document.getElementById('addUrlsArea').value.trim();
+            if (!text) return;
+            const urls = text.split('\n').map(u => u.trim()).filter(u => u);
+            await fetch('/api/schedules/' + id + '/urls', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({urls})
+            });
+            viewSchedule(id);
+        }
+
+        // ═══ Google Drive Functions ═══
+        async function loadGDrive() {
+            try {
+                const res = await fetch('/api/gdrive/status');
+                const status = await res.json();
+                const el = document.getElementById('gdriveStatus');
+
+                if (!status.configured) {
+                    el.innerHTML = `<div class="empty-state">
+                        <div class="icon">☁️</div>
+                        <h3>Kết nối Google Drive</h3>
+                        <p style="max-width:500px;margin:0 auto 16px;line-height:1.6">
+                            Để tự động lưu file PDF lên Google Drive, bạn cần:<br>
+                            1. Vào <a href="https://console.cloud.google.com" target="_blank" style="color:var(--accent)">Google Cloud Console</a><br>
+                            2. Tạo project → Enable "Google Drive API"<br>
+                            3. Tạo OAuth2 credentials (Desktop app)<br>
+                            4. Tải <b>credentials.json</b>
+                        </p>
+                        <div style="margin-top:8px">
+                            <textarea class="input-field" id="gdriveCredsInput" rows="4" placeholder='Dán nội dung credentials.json vào đây...' style="resize:vertical;font-family:monospace;font-size:0.8rem"></textarea>
+                            <button class="btn-primary" style="margin-top:8px" onclick="saveGDriveCreds()">💾 Lưu Credentials</button>
+                        </div>
+                    </div>`;
+                } else if (!status.authorized) {
+                    // Show auth URL
+                    const authRes = await fetch('/api/gdrive/auth-url');
+                    const authData = await authRes.json();
+                    el.innerHTML = `<div class="empty-state">
+                        <div class="icon">🔑</div>
+                        <h3>Xác thực Google Drive</h3>
+                        <p>Click link bên dưới để đăng nhập Google và cấp quyền:</p>
+                        <a href="${authData.url}" target="_blank" class="btn-primary" style="display:inline-block;margin:12px 0;text-decoration:none">🔗 Đăng nhập Google</a>
+                        <div style="margin-top:12px">
+                            <input type="text" class="input-field" id="gdriveAuthCode" placeholder="Dán mã xác thực từ Google...">
+                            <button class="btn-primary" style="margin-top:8px" onclick="submitGDriveAuth()">✅ Xác thực</button>
+                        </div>
+                    </div>`;
+                } else {
+                    el.innerHTML = `<div style="text-align:center;padding:20px">
+                        <div style="font-size:2rem;margin-bottom:8px">✅</div>
+                        <h3 style="margin:0 0 8px;color:var(--accent)">Google Drive đã kết nối</h3>
+                        <p style="color:var(--text2)">File PDF sẽ tự động upload khi bật trong lịch tải</p>
+                        <button class="btn-primary" style="margin-top:12px;background:#e74c3c;padding:8px 16px;font-size:0.85rem" onclick="disconnectGDrive()">🔌 Ngắt kết nối</button>
+                    </div>`;
+
+                    // Load files
+                    document.getElementById('gdriveFiles').style.display = '';
+                    loadGDriveFiles();
+                }
+            } catch(e) {
+                document.getElementById('gdriveStatus').innerHTML = '<p style="color:#e74c3c">Lỗi tải trạng thái GDrive</p>';
+            }
+        }
+
+        async function saveGDriveCreds() {
+            const text = document.getElementById('gdriveCredsInput').value.trim();
+            if (!text) return;
+            try {
+                JSON.parse(text); // validate JSON
+            } catch(e) { alert('JSON không hợp lệ!'); return; }
+            try {
+                const res = await fetch('/api/gdrive/credentials', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({credentials: text})
+                });
+                const data = await res.json();
+                alert(data.message);
+                loadGDrive();
+            } catch(e) { alert('Lỗi kết nối'); }
+        }
+
+        async function submitGDriveAuth() {
+            const code = document.getElementById('gdriveAuthCode').value.trim();
+            if (!code) return;
+            try {
+                const res = await fetch('/api/gdrive/authorize', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({code})
+                });
+                const data = await res.json();
+                alert(data.message);
+                loadGDrive();
+            } catch(e) { alert('Lỗi kết nối'); }
+        }
+
+        async function disconnectGDrive() {
+            if (!confirm('Ngắt kết nối Google Drive?')) return;
+            await fetch('/api/gdrive/disconnect', {method: 'POST'});
+            document.getElementById('gdriveFiles').style.display = 'none';
+            loadGDrive();
+        }
+
+        async function loadGDriveFiles() {
+            try {
+                const res = await fetch('/api/gdrive/files');
+                const files = await res.json();
+                const el = document.getElementById('gdriveFilesList');
+                if (!files.length) {
+                    el.innerHTML = '<p style="color:var(--text2);text-align:center">Chưa có file nào</p>';
+                    return;
+                }
+                el.innerHTML = files.map(f => `
+                    <div class="history-item">
+                        <div class="history-icon">📄</div>
+                        <div class="history-details">
+                            <div class="history-title"><a href="${f.link}" target="_blank" style="color:var(--text1);text-decoration:none">${f.name}</a></div>
+                            <div class="history-meta">${(f.size/1024/1024).toFixed(1)}MB · ${new Date(f.created).toLocaleString('vi-VN')}</div>
+                        </div>
+                    </div>`).join('');
+            } catch(e) { console.error(e); }
         }
 
         // ═══ Init ═══

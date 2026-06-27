@@ -33,6 +33,7 @@ from downloader import download_scribd_document, extract_doc_id
 import database as db
 import account_manager as acct_mgr
 import ai_helper
+import scheduler
 
 # Configuration
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -93,6 +94,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/accounts \\- Danh sách tài khoản\n"
         "/addaccount \\- Thêm tài khoản Scribd\n"
         "/removeaccount \\- Xóa tài khoản\n"
+        "/batch \\- Tải hàng loạt\n"
+        "/schedules \\- Xem lịch tải\n"
         "/help \\- Trợ giúp"
     )
     await update.message.reply_text(welcome, parse_mode="MarkdownV2")
@@ -249,6 +252,89 @@ async def removeaccount_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     db.delete_account(account["id"])
     await update.message.reply_text(f"✅ Đã xóa tài khoản {email}")
+
+
+async def batch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create batch download: /batch name\nurl1\nurl2\n..."""
+    text = update.message.text.replace("/batch", "", 1).strip()
+    if not text:
+        await update.message.reply_text(
+            "📅 *Tải hàng loạt:*\n\n"
+            "```\n/batch Tên lịch tải\nhttps://scribd.com/document/123/...\nhttps://scribd.com/document/456/...\n```\n"
+            "Gửi tên ở dòng đầu, các link Scribd ở các dòng sau\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    lines = text.split("\n")
+    name = lines[0].strip()
+    urls = [l.strip() for l in lines[1:] if l.strip()]
+
+    if not urls:
+        await update.message.reply_text("❌ Chưa có link nào. Mỗi link 1 dòng sau tên.")
+        return
+
+    user_id = str(update.effective_user.id)
+    result = scheduler.create_schedule(
+        name=name, urls=urls, schedule_type="now",
+        created_by=user_id
+    )
+
+    msg = await update.message.reply_text(
+        f"📅 Đã tạo lịch tải *{name}*\n"
+        f"📄 {result['items_count']} files\n"
+        f"⏳ Đang tải...",
+        parse_mode="Markdown"
+    )
+
+    # Run in background
+    run_result = await scheduler.run_schedule(result["id"])
+
+    if run_result:
+        await msg.edit_text(
+            f"📅 *{name}* — Hoàn tất!\n\n"
+            f"✅ Thành công: {run_result['success']}\n"
+            f"❌ Thất bại: {run_result['failed']}\n"
+            f"📄 Tổng: {run_result['total']}",
+            parse_mode="Markdown"
+        )
+
+        # Send successful files
+        sched = scheduler.get_schedule(result["id"])
+        if sched:
+            for item in sched["items"]:
+                if item["status"] == "completed" and item["file_path"] and os.path.exists(item["file_path"]):
+                    file_size = os.path.getsize(item["file_path"])
+                    if file_size <= 50 * 1024 * 1024:
+                        try:
+                            with open(item["file_path"], "rb") as f:
+                                await update.message.reply_document(
+                                    document=f,
+                                    filename=os.path.basename(item["file_path"]),
+                                    caption=f"📚 {item['title']}\n📃 {item.get('pages', '?')} trang",
+                                )
+                        except Exception as e:
+                            logger.warning(f"Failed to send file: {e}")
+
+
+async def schedules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all schedules: /schedules"""
+    schedules = scheduler.get_all_schedules(limit=10)
+    if not schedules:
+        await update.message.reply_text("📅 Chưa có lịch tải nào.\n\nDùng /batch để tạo mới.")
+        return
+
+    lines = ["📅 *Danh sách lịch tải:*\n"]
+    for s in schedules:
+        icons = {"pending": "⏳", "running": "🔄", "completed": "✅",
+                 "completed_with_errors": "⚠️", "failed": "❌", "paused": "⏸"}
+        icon = icons.get(s["status"], "📅")
+        lines.append(
+            f"{icon} *{s['name']}* — {s['total_items']} files "
+            f"(✅{s['completed_items']} ❌{s['failed_items']})"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ═══════════════════════════════════════════
@@ -433,6 +519,8 @@ def main():
     app.add_handler(CommandHandler("accounts", accounts_command))
     app.add_handler(CommandHandler("addaccount", addaccount_command))
     app.add_handler(CommandHandler("removeaccount", removeaccount_command))
+    app.add_handler(CommandHandler("batch", batch_command))
+    app.add_handler(CommandHandler("schedules", schedules_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("🤖 Bot started!")
